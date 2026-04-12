@@ -6,3 +6,6 @@ __pycache__/
 *.log
 *.bak
 *.tmp
+codebase_specification.md
+session_notes.md
+modules/test_out.jcns
