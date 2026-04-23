@@ -348,6 +348,19 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+    def check(self, context):
+        change_ext = False
+        filepath = self.filepath
+        if filepath != "":
+            ext = self.filename_ext
+            if not filepath.lower().endswith(ext.lower()):
+                if filepath.lower().endswith(".jcns"):
+                    self.filepath = filepath + ext.replace(".jcns", "")
+                else:
+                    self.filepath = filepath + ext
+                change_ext = True
+        return change_ext
+
     def execute(self, context):
         from . import get_constraint_empties
 
