@@ -1,37 +1,85 @@
 import struct
 import os
 
+# Version-specific layout constants.  DataEntry pointer offsets (0x50–0xC0) are
+# identical for all supported versions; only the counts region and ConstraintInfo
+# start differ.
+LAYOUTS = {
+    102: {
+        'counts_base': 0xD0,
+        'cns_info_start': 0xF0,   # fixed; None → read ConstraintInfoEntry @ 0x58
+        'counts_fields': {
+            'HashCount':                       (0x00, '<i'),
+            'ConeDriverCount':                 (0x04, '<H'),
+            'ConstraintCount':                 (0x06, '<H'),
+            'DependencyCount':                 (0x08, '<H'),
+            'ObjectSettingCount':              (0x0A, '<H'),
+            'RotExpressionInfoCount':          (0x0C, '<H'),
+            'RotExpressionMapCount':           (0x0E, '<H'),
+            'SkinConstraintCount':             (0x10, '<H'),
+            'SkinConstraintHashTableItemCount':(0x12, '<H'),
+            'SkinConstraintSourceCount':       (0x14, '<H'),
+            'AimConstraintCount':              (0x16, '<H'),
+            'MaterialConstraintInfoCount':     (0x18, '<H'),
+            'SectionCount':                    (0x1A, '<B'),
+        },
+    },
+    35: {
+        'counts_base': 0xC8,
+        'cns_info_start': None,   # read ConstraintInfoEntry @ 0x58
+        'counts_fields': {
+            'HashCount':                  (0x00, '<i'),
+            'ConeDriverCount':            (0x04, '<H'),
+            'ConstraintCount':            (0x06, '<H'),
+            'DependencyCount':            (0x08, '<H'),
+            'ObjectSettingCount':         (0x0A, '<H'),
+            'RotExpressionInfoCount':     (0x0C, '<H'),
+            'RotExpressionMapCount':      (0x0E, '<H'),
+            'SkinConstraintCount':        (0x10, '<H'),
+            'SkinConstraintSourceCount':  (0x12, '<H'),
+            'AimConstraintCount':         (0x14, '<H'),
+            'MaterialConstraintInfoCount':(0x16, '<H'),
+            # 0x18: UnknownUInt16 — skipped
+            'SectionCount':               (0x1A, '<B'),
+        },
+    },
+}
+
+VERSION_GAME_MAP = {102: 'MHW_WILDS', 35: 'RE9'}
+
+
 class JCNSParser:
     """
     Parser for RE Engine JCNS v102 files.
 
     80-byte ConstraintInfo block layout (parent, at 0xF0 + n*80):
-      +0:   ExtraCnsInfo_Offset  uint64   pointer to extra info (0 if none)
-      +8:   OffsetSourceList     uint64   pointer to ConstraintSource_v2
-      +16:  ObjectNameOffset     uint64   pointer to TARGET bone name (UTF-16LE)
-      +24:  PropertyOffset       uint64   pointer to property name (0 usually)
-      +32:  TargetHashIndex      uint32   index into hash_list → target bone hash
-      +36:  ObjectHash           uint32   direct target bone hash (redundant with above)
-      +40:  PropertyHash         uint32   property hash
-      +44:  ExtraInfoCount       uint8
-      +45:  SourceCount          uint8    number of sources (usually 1)
-      +46:  UnknownFlags         uint8    0x30 in all observed files
-      +47:  TransformType        uint8    0=Location 1=Rotation 2=Scale 3=BlendShape ...
-      +48:  UnknownVector        vec4     [0,0,0,1] (quaternion identity at rest)
-      +64:  UnknownFloat2        float[2] [0,0] usually
-      +72:  UnknownUInt8         uint8
-      +73:  TransformAxis        uint8    AxisID on the parent block (may differ from src-specific tgt axis)
-      +74:  UnknownUInt8 × 5
+      +0:   ConeDriverInfoOffset  uint64   bt: ConeDriverInfoList.Offset (0=none)
+      +8:   OffsetSourceList      uint64   pointer to ConstraintSource_v2
+      +16:  ObjectNameOffset      uint64   pointer to TARGET bone name (UTF-16LE)
+      +24:  PropertyOffset        uint64   pointer to property name (0 usually)
+      +32:  TargetHashIndex       uint32   index into hash_list → target bone hash
+      +36:  ObjectHash            uint32   direct target bone hash (redundant with above)
+      +40:  PropertyHash          uint32   property hash
+      +44:  ConeDriverInfoCount   uint8    bt: ConeDriverInfoCount
+      +45:  SourceCount           uint8    number of sources (usually 1)
+      +46:  Flags                 uint8    bt: flags_cns  — 0x30 in all observed files
+      +47:  TransformType         uint8    bt: TransformationID  0=Translation 1=Rotation 2=Scale …
+      +48:  UnknownVector4D       vec4     [0,0,0,1] (quaternion identity at rest)
+      +64:  UnknownFloat2         float[2] [0,0] usually
+      +72:  UnknownUInt8          uint8
+      +73:  TransformAxis         uint8    bt: AxisID — target axis (may differ from src-specific)
+      +74:  UnknownUInt8 × 6
 
     72-byte ConstraintSource_v2 layout (pointed to by OffsetSourceList):
-      +0:   ExtraCnsInfo_Offset  uint64   pointer (0 if none)
-      +8:   SourceNameOffset     uint64   pointer to SOURCE bone name (UTF-16LE)
-      +16:  SourceHashIndex      uint32   index into hash_list → source bone hash
-      +20:  Unknown1             uint32   = 0 in all observed files
-      +24:  source_axis          uint8    0=X 1=Y 2=Z 3=W
-      +25:  UnkByte1             uint8    = 1 in all observed files
-      +26:  target_axis          uint8    0=X 1=Y 2=Z 3=W  (per-source specific)
-      +27:  UnkByte2             uint8    = 0 in all observed files
+      +0:   ComplexMappingInfoOffset  uint64   bt: ComplexMappingInfoOffset (0=none)
+      +8:   SourceNameOffset          uint64   pointer to SOURCE bone name (UTF-16LE)
+      +16:  SourceHashIndex           uint32   index into hash_list → source bone hash
+      +20:  ComplexMappingInfoCount   uint16   bt: ComplexMappingInfoCount (0 in all observed)
+      +22:  UnknownUInt16             uint16   = 0 in all observed files
+      +24:  UnkByte0                  uint8    constant 3 in all observed files; NOT an axis
+      +25:  Interpolation             uint8    bt: InterpolationID  1=FastInAndOut in all observed
+      +26:  source_axis               uint8    bt: SourceAxis  0=X 1=Y 2=Z 3=W
+      +27:  UnkByte2                  uint8    = 0 in all observed files
       +28:  UnknownUInt32_2      uint32   = 0
       +32:  from_start           float    Point A source angle (rest-side boundary)
       +36:  from_kink            float    Point B source angle (kink/折点 — slope changes here)
@@ -95,9 +143,19 @@ class JCNSParser:
         with open(self.filepath, 'rb') as f:
             data = f.read()
         self.original_bytes = data
+        self.aim_constraints    = []
+        self.rot_expressions    = []
+        self.rot_expression_map = b''
+        self.material_cns       = []
+        self.joint_export_graph = None
         self._parse_header(data)
         self._parse_hash_list(data)
         self._parse_constraints(data)
+        self._store_inline_blob(data)
+        self._parse_aim_constraints(data)
+        self._parse_rot_expressions(data)
+        self._parse_material_cns(data)
+        self._parse_joint_export_graph(data)
         return self.constraints
 
     def _parse_header(self, data):
@@ -105,41 +163,186 @@ class JCNSParser:
         print(f"Version: {version}")
         self.header['Version'] = version
 
-        # TAG struct layout starting at byte 4 (after uint32 version):
-        #   [4..7]   magic/signature (4 bytes)
-        #   [8..15]  UnknownQWORD
-        #   [16..23] InfoOffset (uint64)
-        #   [24..31] UnknownQWORD
-        #   [32..39] FileEntry (uint64) → address of DataOffset qword
-        #   [40..47] UnknownQWORD
+        if version not in LAYOUTS:
+            raise ValueError(f"Unsupported JCNS version: {version}. Supported: {list(LAYOUTS)}")
+        layout = LAYOUTS[version]
+        self.header['layout'] = layout
+
+        # Tags block: JCNSEntry at byte 32 → DataEntry pointer
         file_entry = struct.unpack_from('<Q', data, 32)[0]
         if file_entry + 8 > len(data):
             raise ValueError(f"FileEntry pointer 0x{file_entry:X} exceeds file size {len(data)}")
-        data_offset_raw = struct.unpack_from('<Q', data, file_entry)[0]
-        if version == 102:
-            data_offset = data_offset_raw * 16
+        data_entry = struct.unpack_from('<Q', data, file_entry)[0]
+        self.header['DataEntry'] = data_entry
+
+        # DataEntry pointer region (0x50–0xC0) — identical layout for all supported versions
+        self.header['SectionTableEntry']       = struct.unpack_from('<Q', data, 0xB0)[0]
+        self.header['DependencyTableEntry']    = struct.unpack_from('<Q', data, 0xB8)[0]
+        self.header['HashListOffset']          = struct.unpack_from('<Q', data, 0xC0)[0]
+        self.header['AimConstraintTableEntry'] = struct.unpack_from('<Q', data, 0x98)[0]
+
+        # Counts region — version-specific base offset and field layout
+        cb = layout['counts_base']
+        for field, (off, fmt) in layout['counts_fields'].items():
+            self.header[field] = struct.unpack_from(fmt, data, cb + off)[0]
+
+        # ConstraintInfo start: fixed value or read from ConstraintInfoEntry pointer @ 0x58
+        if layout['cns_info_start'] is not None:
+            self.header['ConstraintSetsStart'] = layout['cns_info_start']
         else:
-            data_offset = data_offset_raw
-        self.header['DataOffset'] = data_offset
+            self.header['ConstraintSetsStart'] = struct.unpack_from('<Q', data, 0x58)[0]
+        self.header['ConstraintSetSize'] = 80
 
-        # Extended header at 0xB0 (v102)
-        self.header['UnknownOffset1'] = struct.unpack_from('<Q', data, 0xB0)[0]
-        self.header['UnknownOffset2'] = struct.unpack_from('<Q', data, 0xB8)[0]
-        self.header['HashListOffset'] = struct.unpack_from('<Q', data, 0xC0)[0]
-        self.header['UnknownOffset3'] = struct.unpack_from('<Q', data, 0xC8)[0]
+    def _parse_rot_expressions(self, data):
+        """
+        Parse BODY1: RotExpression section (Type 1).
 
-        # Counts at 0xD0
-        self.header['HashCount']      = struct.unpack_from('<H', data, 0xD0)[0]
-        self.header['UnknownCount1']  = struct.unpack_from('<H', data, 0xD2)[0]
-        self.header['ExtraJointCount']= struct.unpack_from('<H', data, 0xD4)[0]
-        self.header['ConstraintCount']= struct.unpack_from('<H', data, 0xD6)[0]
+        For v102 (>=35), four sub-sections:
+          RotExpressionInfo[N]            at 0x68,  56 bytes each (direct hashes)
+          RotExpressionMap[M]             at 0x70,  1 byte each
+          SourceJointHashIndices[N]       at 0x78,  4 bytes each (int32 index)
+          JointHashIndices[N]             at 0x80,  4 bytes each (int32 index)
+        Counts at 0xDC (InfoCount) and 0xDE (MapCount).
+        """
+        n = self.header.get('RotExpressionInfoCount', 0)
+        self.rot_expressions = []
+        if n == 0:
+            return
 
-        # Entry table at 0xF0 (ConstraintInfo array for v102)
-        self.header['ConstraintSetsStart'] = 0xF0
-        self.header['ConstraintSetSize']   = 80
-        # Store raw entry table bytes for lossless writer
-        self.header['EntryTableBlock'] = data[0xF0:0xF0 + 16]
-        self.header['CountsBlock']     = data[0xD0:0xD0 + 32]
+        info_off   = struct.unpack_from('<Q', data, 0x68)[0]
+        map_off    = struct.unpack_from('<Q', data, 0x70)[0]
+        src_idx_off= struct.unpack_from('<Q', data, 0x78)[0]
+        jnt_idx_off= struct.unpack_from('<Q', data, 0x80)[0]
+        m          = struct.unpack_from('<H', data, 0xDE)[0]
+
+        for i in range(n):
+            base = info_off + i * 56
+            block = data[base:base + 56]
+            # RotExpressionInfo layout: vec4 Rotation[0..15], vec4 Scale[16..31],
+            # hash JointHash[32..35], hash SourceJointHash[36..39], uint8[4][40..43], float[3][44..55]
+            joint_hash  = struct.unpack_from('<I', block, 32)[0]
+            src_hash    = struct.unpack_from('<I', block, 36)[0]
+
+            # Hash-index arrays (int32 each; -1 = unused)
+            src_idx = struct.unpack_from('<i', data, src_idx_off + i * 4)[0] if src_idx_off else -1
+            jnt_idx = struct.unpack_from('<i', data, jnt_idx_off + i * 4)[0] if jnt_idx_off else -1
+
+            self.rot_expressions.append({
+                'JointHash':      joint_hash,
+                'SourceJointHash': src_hash,
+                'SrcJointHashIndex': src_idx,
+                'JntHashIndex':   jnt_idx,
+                'info_raw':  bytes(block),          # 56 bytes — direct hashes, copy verbatim
+            })
+
+        self.rot_expression_map = bytes(data[map_off:map_off + m]) if map_off and m else b''
+        print(f"Parsed {n} RotExpression(s), map={m}")
+
+    def _parse_material_cns(self, data):
+        """
+        Parse BODY4: Material constraint section (Type 4).
+
+        For v102 (>=35), each MatCnsInfo is 16 bytes:
+          [0]  int32  JointHashIndex   → hash_list[idx]
+          [4]  uint32 MaterialNameHash (direct)
+          [8]  uint32 MaterialPropertyHash (direct)
+          [12] uint8  TransformationID
+          [13..15] 3 unknown bytes
+        """
+        n   = struct.unpack_from('<H', data, 0xE8)[0]
+        off = struct.unpack_from('<Q', data, 0xA0)[0]
+        self.material_cns = []
+        if n == 0 or off == 0:
+            return
+
+        for i in range(n):
+            base = off + i * 16
+            block = data[base:base + 16]
+            jh_idx = struct.unpack_from('<i', block, 0)[0]
+            jh     = self.hash_list[jh_idx] if 0 <= jh_idx < len(self.hash_list) else 0
+            self.material_cns.append({
+                'JointHashIndex': jh_idx,
+                'JointHash':      jh,
+                'raw_body': bytes(block[4:]),  # 12 bytes after JointHashIndex (recomputed on write)
+            })
+        print(f"Parsed {n} MaterialConstraint(s)")
+
+    def _parse_joint_export_graph(self, data):
+        """
+        Parse BODY5: JointExportGraph (Type 5) — zero or one entry.
+
+        Structure:
+          uint64 PathOffset  → pointer to UTF-16LE null-terminated path string
+        """
+        off = struct.unpack_from('<Q', data, 0xA8)[0]
+        self.joint_export_graph = None
+        if off == 0:
+            return
+
+        path_ptr = struct.unpack_from('<Q', data, off)[0]
+        path_str = self._read_wstring(data, path_ptr) if path_ptr else ''
+        self.joint_export_graph = {'path': path_str}
+        print(f"Parsed JointExportGraph: '{path_str}'")
+
+    def _parse_aim_constraints(self, data):
+        """
+        Parse ConstraintAim entries (BODY3, Section Type 3).
+
+        For v102 (>= 35 in bt terms) each inline block is 80 bytes:
+          [0]   uint64  AimTargetInfo.Offset  → pointer to 16-byte target block
+          [8]   int32   JointHashIndex        → hash_list[idx] = joint being aimed
+          [12]  int32   UnkJointHashIndex     → hash_list[idx] or -1 (unused)
+          [16..79]      vectors + tail bytes (72 bytes - 8 = actually bytes[16..79], 64b)
+        Wait: [8..79] is 72 bytes total inline body after offset.
+
+        Target block (16 bytes at Offset):
+          [0]   int32   TargetJointHashIndex  → hash_list[idx] = target bone
+          [4]   float   Influence
+          [8]   uint64  UnknownQWORD
+        """
+        count  = self.header.get('AimConstraintCount', 0)
+        offset = self.header.get('AimConstraintTableEntry', 0)
+        self.aim_constraints = []
+        if count == 0 or offset == 0:
+            return
+
+        for i in range(count):
+            base  = offset + i * 80
+            block = data[base:base + 80]
+
+            tgt_ptr          = struct.unpack_from('<Q', block, 0)[0]
+            joint_idx        = struct.unpack_from('<i', block, 8)[0]   # signed: -1 = unused
+            unk_joint_idx    = struct.unpack_from('<i', block, 12)[0]
+
+            joint_hash     = self.hash_list[joint_idx]     if 0 <= joint_idx     < len(self.hash_list) else 0
+            unk_joint_hash = self.hash_list[unk_joint_idx] if 0 <= unk_joint_idx < len(self.hash_list) else 0
+
+            # Parse target block
+            tgt_idx   = -1
+            tgt_hash  = 0
+            if 0 < tgt_ptr and tgt_ptr + 16 <= len(data):
+                tgt_idx  = struct.unpack_from('<i', data, tgt_ptr)[0]
+                tgt_hash = self.hash_list[tgt_idx] if 0 <= tgt_idx < len(self.hash_list) else 0
+                tgt_body = bytes(data[tgt_ptr + 4 : tgt_ptr + 16])  # Influence + UnkQW (12 bytes)
+            else:
+                tgt_body = b'\x00' * 12
+
+            self.aim_constraints.append({
+                'JointHashIndex':    joint_idx,
+                'JointHash':         joint_hash,
+                'UnkJointHashIndex': unk_joint_idx,
+                'UnkJointHash':      unk_joint_hash,
+                'TargetHashIndex':   tgt_idx,
+                'TargetHash':        tgt_hash,
+                # Bytes [8..79] of inline block (excludes the 8-byte offset pointer)
+                'inline_body':  bytes(block[8:]),   # 72 bytes
+                # Bytes [4..15] of target block (excludes the 4-byte hash-index)
+                'target_body':  tgt_body,            # 12 bytes
+            })
+
+        print(f"Parsed {count} Aim constraint(s):")
+        for i, ac in enumerate(self.aim_constraints):
+            print(f"  Aim[{i}]: joint=0x{ac['JointHash']:08X}  target=0x{ac['TargetHash']:08X}")
 
     def _parse_hash_list(self, data):
         hl_offset = self.header['HashListOffset']
@@ -157,17 +360,17 @@ class JCNSParser:
         count = self.header['ConstraintCount']
         if count == 0:
             return
-        print(f"DEBUG: Parsing ConstraintSets array at 0xF0, Count = {count}")
+        print(f"DEBUG: Parsing ConstraintSets array at 0x{self.header['ConstraintSetsStart']:X}, Count = {count}")
 
         self.constraints = []
         for idx in range(count):
-            parent_off = 0xF0 + idx * 80
+            parent_off = self.header['ConstraintSetsStart'] + idx * 80
             parent = data[parent_off:parent_off + 80]
 
             c = {}
             # --- Parent block fields ---
             c['ParentSetOffset']    = parent_off
-            c['ExtraCnsInfo_Offset']= struct.unpack_from('<Q', parent, 0)[0]
+            c['ConeDriverInfoOffset']= struct.unpack_from('<Q', parent, 0)[0]
             src_list_ptr            = struct.unpack_from('<Q', parent, 8)[0]
             c['LimitsPointer']      = src_list_ptr
             obj_name_off            = struct.unpack_from('<Q', parent, 16)[0]
@@ -175,9 +378,9 @@ class JCNSParser:
             c['TargetHashIndex']    = struct.unpack_from('<I', parent, 32)[0]  # index into hash_list
             c['ObjectHash']         = struct.unpack_from('<I', parent, 36)[0]  # direct hash value
             c['PropertyHash']       = struct.unpack_from('<I', parent, 40)[0]
-            c['ExtraInfoCount_parent'] = parent[44]
+            c['ConeDriverInfoCount']   = parent[44]
             c['SourceCount_parent']    = parent[45]
-            c['UnknownFlags']          = parent[46]
+            c['Flags']                 = parent[46]
             c['TransformType']         = parent[47]
             # vec4 at +48
             c['ParentVec4'] = struct.unpack_from('<4f', parent, 48)
@@ -198,6 +401,8 @@ class JCNSParser:
             # --- 72-byte ConstraintSource_v2 ---
             src = self._parse_source_struct(data, src_list_ptr)
             c.update(src)
+            # target_axis = TransformAxis from ConstraintInfo[+73], not from source block
+            c['target_axis'] = c['TransformAxis_parent']
 
             self.constraints.append(c)
 
@@ -211,9 +416,29 @@ class JCNSParser:
                 f"targetHash32=0x{c['TargetHash']:08x}  "
                 f"srcAxis={sa}({c.get('source_axis',0)})  "
                 f"tgtAxis={ta}({c.get('target_axis',0)})  "
-                f"From=[{c['from_start']}, kink={c['from_kink']}, {c['from_end']}] "
-                f"To=[{c['to_start']}, kink={c['to_kink']}, {c['to_end']}]"
+                + (f"From=[{c['from_start']}, kink={c['from_kink']}, {c['from_end']}] "
+                   f"To=[{c['to_start']}, kink={c['to_kink']}, {c['to_end']}]"
+                   if 'from_start' in c else "(no source)")
             )
+
+    def _store_inline_blob(self, data):
+        """
+        For v35 files only: capture the region between ConstraintInfo-end and DependencyTable-start.
+        This region contains ConeDriverInfo blobs, Source_v2 structs with embedded WStrings,
+        and unknown gap data.  The writer preserves it verbatim, patching only editable fields.
+        v102 files always use the full rebuild path and must never set inline_blob.
+        """
+        if self.header.get('Version') != 35:
+            self.inline_blob = b''
+            return
+        cns_end = self.header['ConstraintSetsStart'] + self.header['ConstraintCount'] * 80
+        dep_start = self.header.get('DependencyTableEntry', 0)
+        self.inline_blob_cns_end = cns_end
+        if dep_start > cns_end:
+            self.inline_blob = bytes(data[cns_end:dep_start])
+            print(f"[JCNS] inline_blob: 0x{cns_end:X}–0x{dep_start:X} ({len(self.inline_blob)} bytes)")
+        else:
+            self.inline_blob = b''
 
     def _parse_source_struct(self, data, ptr):
         """Parse the 72-byte ConstraintSource_v2 starting at ptr."""
@@ -226,17 +451,19 @@ class JCNSParser:
             return s
 
         block = data[ptr:ptr + 72]
-        s['ExtraCnsInfo_Offset'] = struct.unpack_from('<Q', block, 0)[0]
-        name_off                  = struct.unpack_from('<Q', block, 8)[0]
-        s['SourceName_Offset']    = name_off
-        s['SourceHashIndex']      = struct.unpack_from('<I', block, 16)[0]
-        s['Unknown1']             = struct.unpack_from('<I', block, 20)[0]
+        s['ComplexMappingInfoOffset'] = struct.unpack_from('<Q', block, 0)[0]
+        name_off                      = struct.unpack_from('<Q', block, 8)[0]
+        s['SourceName_Offset']        = name_off
+        s['SourceHashIndex']          = struct.unpack_from('<I', block, 16)[0]
+        s['ComplexMappingInfoCount']  = struct.unpack_from('<H', block, 20)[0]
+        s['UnknownUInt16']            = struct.unpack_from('<H', block, 22)[0]
 
-        # Axis bytes packed at +24
-        s['source_axis'] = block[24]   # AxisID: 0=X 1=Y 2=Z 3=W
-        s['UnkByte1']    = block[25]   # typically 1
-        s['target_axis'] = block[26]   # AxisID: 0=X 1=Y 2=Z 3=W
-        s['UnkByte2']    = block[27]   # typically 0
+        # +24: unknown constant (always 3); +25: InterpolationID (always 1=FastInAndOut)
+        # +26: SourceAxis (0=X 1=Y 2=Z 3=W); +27: unknown (always 0)
+        s['UnkByte0']    = block[24]
+        s['Interpolation'] = block[25]
+        s['source_axis'] = block[26]
+        s['UnkByte2']    = block[27]
 
         s['UnknownUInt32_2'] = struct.unpack_from('<I', block, 28)[0]
 
