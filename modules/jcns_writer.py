@@ -13,7 +13,7 @@ class JCNSWriter:
     # Public API
     # ------------------------------------------------------------------
 
-    def build_lossless(self):
+    def build_lossless(self, clean_hashes=False):
         """
         Fully rebuild the JCNS v102 file, supporting:
           - Changed source/target bone names (with hash lookup)
@@ -23,13 +23,13 @@ class JCNSWriter:
         (0x00..0x4F) and the static per-constraint fields are preserved
         from the original.
         """
-        return self._build_full()
+        return self._build_full(clean_hashes)
 
     # ------------------------------------------------------------------
     # Internal rebuild
     # ------------------------------------------------------------------
 
-    def _build_full(self):
+    def _build_full(self, clean_hashes=False):
         p = self.parser
         orig = p.original_bytes
 
@@ -39,9 +39,11 @@ class JCNSWriter:
             sys.path.insert(0, hash_dir)
         from mmh3.pymmh3 import hashUTF16  # noqa: F401 (runtime import)
 
-        # ── Phase 1: build new hash list (clean rebuild) ─────────────────
-        # To avoid bloat and noise, rebuild hash list only from active constraints
-        new_hash_list = []
+        # ── Phase 1: build new hash list ────────────────────────────────
+        if clean_hashes:
+            new_hash_list = []
+        else:
+            new_hash_list = list(p.hash_list)
 
         def _get_or_add(name):
             """Return (hash32, index) for a bone name, adding to list if missing."""

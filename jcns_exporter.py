@@ -15,7 +15,7 @@ import os
 import sys
 import hashlib
 import bpy
-from bpy.props import StringProperty
+from bpy.props import StringProperty, BoolProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
 
@@ -322,6 +322,11 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
         default="*.jcns.102;*.jcns.29;*.jcns.35",
         options={'HIDDEN'},
     )
+    clean_hashes: BoolProperty(
+        name="Remove Redundant Hashes",
+        description="Delete hashes that are no longer used by any constraints. If unchecked, all original hashes are preserved",
+        default=False
+    )
 
     @classmethod
     def poll(cls, context):
@@ -410,7 +415,7 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
         try:
             from jcns_writer import JCNSWriter
             writer = JCNSWriter(parser, out_path)
-            writer.build_lossless()
+            writer.build_lossless(clean_hashes=self.clean_hashes)
         except Exception as exc:
             self.report({'ERROR'}, f"Writer error: {exc}")
             return {'CANCELLED'}
