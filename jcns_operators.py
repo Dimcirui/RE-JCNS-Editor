@@ -35,14 +35,20 @@ def _ensure_modules_path():
 # ---------------------------------------------------------------------------
 
 _EULER_MODES = ('XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX')
-_ROT_TYPE    = ['ROT_X', 'ROT_Y', 'ROT_Z']
+_ROT_TYPE   = ['ROT_X',   'ROT_Y',   'ROT_Z']
+_LOC_TYPE   = ['LOC_X',   'LOC_Y',   'LOC_Z']
+_SCALE_TYPE = ['SCALE_X', 'SCALE_Y', 'SCALE_Z']
 
 
 def _build_piecewise_expr(from_start, from_kink, from_end,
-                           to_start,   to_kink,   to_end):
+                           to_start,   to_kink,   to_end,
+                           use_radians=True):
     """
     Build a Blender SCRIPTED driver expression implementing the three-point
-    piecewise linear mapping (values in DEGREES, converted to radians here).
+    piecewise linear mapping.
+
+    use_radians=True  → values are in degrees, converted to radians (Rotation).
+    use_radians=False → values are used as-is (Location / Scale).
 
       Seg 1: source [from_start → from_kink]  →  output [to_start → to_kink]
       Seg 2: source [from_kink  → from_end]   →  output [to_kink  → to_end]
@@ -50,12 +56,16 @@ def _build_piecewise_expr(from_start, from_kink, from_end,
     The expression is clamped so output stays within the output range.
     Degenerate cases (collapsed segments) are handled gracefully.
     """
-    fs = math.radians(from_start)
-    fk = math.radians(from_kink)
-    fe = math.radians(from_end)
-    ts = math.radians(to_start)
-    tk = math.radians(to_kink)
-    te = math.radians(to_end)
+    if use_radians:
+        fs = math.radians(from_start)
+        fk = math.radians(from_kink)
+        fe = math.radians(from_end)
+        ts = math.radians(to_start)
+        tk = math.radians(to_kink)
+        te = math.radians(to_end)
+    else:
+        fs, fk, fe = from_start, from_kink, from_end
+        ts, tk, te = to_start,   to_kink,   to_end
 
     span1 = fk - fs
     span2 = fe - fk
@@ -89,30 +99,47 @@ def _build_piecewise_expr(from_start, from_kink, from_end,
 def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
                   source_bone_name, source_axis_idx,
                   from_start, from_kink, from_end,
-                  to_start, to_kink, to_end):
+                  to_start, to_kink, to_end,
+                  transform_type='Rotation'):
     """
-    Install (or replace) a SCRIPTED piecewise-linear rotation driver.
+    Install (or replace) a SCRIPTED piecewise-linear driver for Rotation,
+    Location, or Scale.
 
-    Three anchor points define a two-segment linear mapping (degrees → radians):
+    Three anchor points define a two-segment linear mapping:
       A  (from_start, to_start)  — first endpoint
       B  (from_kink,  to_kink)   — slope-change / fold point
       C  (from_end,   to_end)    — second endpoint
 
-    Rotation-mode strategy:
-      • Euler mode → drive rotation_euler[axis] directly.
-      • QUATERNION / AXIS_ANGLE → switch to XYZ Euler first (safe because
-        output = 0 at rest pose, so the mode switch has no visual offset).
-    Source read in LOCAL_SPACE (bone-local rotation in radians).
-    Returns (ok: bool, error_str: str).
+    Rotation: values in degrees → converted to radians; drives rotation_euler.
+              Euler mode forced if bone is in QUATERNION/AXIS_ANGLE.
+    Location: values used as-is (Blender units); drives location.
+    Scale:    values used as-is (multipliers); drives scale.
+
+    Source read in LOCAL_SPACE. Returns (ok: bool, error_str: str).
     """
     pose_bone = armature_obj.pose.bones.get(target_bone_name)
     if pose_bone is None:
         return False, f"Target bone '{target_bone_name}' not found"
 
-    if pose_bone.rotation_mode not in _EULER_MODES:
-        pose_bone.rotation_mode = 'XYZ'
+    ax = min(source_axis_idx, 2)
 
-    data_path = "rotation_euler"
+    if transform_type == 'Rotation':
+        if pose_bone.rotation_mode not in _EULER_MODES:
+            pose_bone.rotation_mode = 'XYZ'
+        data_path   = "rotation_euler"
+        var_tf_type = _ROT_TYPE[ax]
+        use_radians = True
+    elif transform_type == 'Location':
+        data_path   = "location"
+        var_tf_type = _LOC_TYPE[ax]
+        use_radians = False
+    elif transform_type == 'Scale':
+        data_path   = "scale"
+        var_tf_type = _SCALE_TYPE[ax]
+        use_radians = False
+    else:
+        return False, f"Transform type '{transform_type}' is not supported for drivers"
+
     pose_bone.driver_remove(data_path, target_axis_idx)
 
     armature_obj.animation_data_create()
@@ -120,7 +147,8 @@ def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
     fc = armature_obj.driver_add(pose_path, target_axis_idx)
 
     expr = _build_piecewise_expr(from_start, from_kink, from_end,
-                                  to_start,   to_kink,   to_end)
+                                  to_start,   to_kink,   to_end,
+                                  use_radians=use_radians)
 
     drv = fc.driver
     drv.type = 'SCRIPTED'
@@ -135,10 +163,10 @@ def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
     tgt = var.targets[0]
     tgt.id = armature_obj
     tgt.bone_target = source_bone_name
-    tgt.transform_type = _ROT_TYPE[min(source_axis_idx, 2)]
+    tgt.transform_type = var_tf_type
     tgt.transform_space = 'LOCAL_SPACE'
 
-    print(f"[JCNS DRIVER] {source_bone_name}({source_axis_idx}) → "
+    print(f"[JCNS DRIVER] [{transform_type}] {source_bone_name}({source_axis_idx}) → "
           f"{target_bone_name}[{target_axis_idx}]  expr={expr}")
 
     return True, ""
@@ -221,6 +249,7 @@ class JCNS_OT_ApplySingleDriver(Operator):
             cns_props.source_bone, src_ax,
             cns_props.from_start, cns_props.from_kink, cns_props.from_end,
             cns_props.to_start, cns_props.to_kink, cns_props.to_end,
+            transform_type=cns_props.transform_type,
         )
         if not ok:
             self.report({'WARNING'}, err)
@@ -229,7 +258,7 @@ class JCNS_OT_ApplySingleDriver(Operator):
         cns_props.driver_applied = True
         self.report(
             {'INFO'},
-            f"Driver: '{cns_props.source_bone}'({cns_props.source_axis}) "
+            f"[{cns_props.transform_type}] Driver: '{cns_props.source_bone}'({cns_props.source_axis}) "
             f"→ '{cns_props.target_bone}'({cns_props.target_axis})"
         )
         return {'FINISHED'}
@@ -297,6 +326,7 @@ class JCNS_OT_ApplyAllDrivers(Operator):
                 p.source_bone, src_ax,
                 p.from_start, p.from_kink, p.from_end,
                 p.to_start, p.to_kink, p.to_end,
+                transform_type=p.transform_type,
             )
             if ok:
                 applied += 1
@@ -338,15 +368,24 @@ class JCNS_OT_ClearAllDrivers(Operator):
         empties = get_constraint_empties(root_obj)
         removed = 0
 
+        _DATA_PATH = {
+            'Rotation': 'rotation_euler',
+            'Location': 'location',
+            'Scale':    'scale',
+        }
+
         for empty in empties:
             p = empty.jcns_cns_props
             if not p.target_bone:
+                continue
+            data_path = _DATA_PATH.get(p.transform_type)
+            if data_path is None:
                 continue
             tgt_ax = AXIS_TO_INT.get(p.target_axis, 0)
             pose_bone = armature_obj.pose.bones.get(p.target_bone)
             if pose_bone:
                 try:
-                    pose_bone.driver_remove("rotation_euler", tgt_ax)
+                    pose_bone.driver_remove(data_path, tgt_ax)
                     removed += 1
                     p.driver_applied = False
                 except Exception:
@@ -437,7 +476,7 @@ class JCNS_OT_DeleteConstraint(Operator):
             for new_idx, empty in enumerate(remaining):
                 p = empty.jcns_cns_props
                 new_name = make_constraint_empty_name(
-                    new_idx, p.source_bone, p.target_bone, p.target_axis
+                    new_idx, p.source_bone, p.target_bone, p.target_axis, p.source_axis
                 )
                 empty.name = new_name
 

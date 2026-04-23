@@ -35,22 +35,63 @@ AXIS_ITEMS = [
     ('W', "W", "W quaternion component (not yet supported as driver target)"),
 ]
 
+INTERPOLATION_ITEMS = [
+    ('Linear',       "Linear",       "Linear interpolation"),
+    ('FastInAndOut', "FastInAndOut", "Fast In And Out (default in all observed files)"),
+    ('FastOut',      "FastOut",      "Fast Out"),
+    ('FastIn',       "FastIn",       "Fast In"),
+    ('SlowInAndOut', "SlowInAndOut", "Slow In And Out"),
+    ('SlowOut',      "SlowOut",      "Slow Out"),
+    ('SlowIn',       "SlowIn",       "Slow In"),
+]
+
+INTERPOLATION_TO_INT = {
+    'Linear': 0, 'FastInAndOut': 1, 'FastOut': 2, 'FastIn': 3,
+    'SlowInAndOut': 4, 'SlowOut': 5, 'SlowIn': 6,
+}
+INT_TO_INTERPOLATION = {v: k for k, v in INTERPOLATION_TO_INT.items()}
+
 TRANSFORM_ITEMS = [
-    ('Location',    "Location",    "Translational constraint"),
-    ('Rotation',    "Rotation",    "Rotational constraint (most common)"),
-    ('Scale',       "Scale",       "Scale constraint"),
-    ('BlendShape',  "BlendShape",  "Blend-shape / morph target"),
-    ('Material',    "Material",    "Material property drive"),
-    ('Unknown',     "Unknown",     "Unrecognised transform type"),
+    ('Translation',    "Translation",    "ID=0: Translational constraint"),
+    ('Rotation',       "Rotation",       "ID=1: Rotational constraint (most common)"),
+    ('Scale',          "Scale",          "ID=2: Scale constraint"),
+    ('BlendShape',     "BlendShape",     "ID=3: Blend-shape / morph target"),
+    ('UnkCtrl_4',      "UnkCtrl_4",      "ID=4: Unknown control type"),
+    ('UnkTopBank_5',   "UnkTopBank_5",   "ID=5: Unknown top-bank type"),
+    ('Unknown_6',      "Unknown_6",      "ID=6: Undefined in bt template"),
+    ('Material_Color', "Material_Color", "ID=7: Material color drive"),
+    ('Material_4D',    "Material_4D",    "ID=8: Material 4D property drive"),
+    ('Material_3D',    "Material_3D",    "ID=9: Material 3D property drive"),
+    ('Material_2D',    "Material_2D",    "ID=10: Material 2D property drive"),
+    ('Scalar',         "Scalar",         "ID=11: Scalar drive"),
+    ('Unknown_12',     "Unknown_12",     "ID=12: Unknown"),
+    ('UnkRotation_13', "UnkRotation_13", "ID=13: Unknown rotation variant"),
+    ('UnkRotation_14', "UnkRotation_14", "ID=14: Unknown rotation variant"),
+    ('UnkRotation_15', "UnkRotation_15", "ID=15: Unknown rotation variant"),
+    ('UnkRotation_16', "UnkRotation_16", "ID=16: Unknown rotation variant"),
 ]
 
 AXIS_TO_INT = {'X': 0, 'Y': 1, 'Z': 2, 'W': 3}
 INT_TO_AXIS = {0: 'X', 1: 'Y', 2: 'Z', 3: 'W'}
 
 TRANSFORM_TYPE_MAP = {
-    0: 'Location', 1: 'Rotation', 2: 'Scale', 3: 'BlendShape',
-    4: 'Unknown', 5: 'Unknown', 7: 'Material', 8: 'Material',
-    9: 'Material', 10: 'Material', 11: 'Unknown',
+    0:  'Translation',
+    1:  'Rotation',
+    2:  'Scale',
+    3:  'BlendShape',
+    4:  'UnkCtrl_4',
+    5:  'UnkTopBank_5',
+    6:  'Unknown_6',
+    7:  'Material_Color',
+    8:  'Material_4D',
+    9:  'Material_3D',
+    10: 'Material_2D',
+    11: 'Scalar',
+    12: 'Unknown_12',
+    13: 'UnkRotation_13',
+    14: 'UnkRotation_14',
+    15: 'UnkRotation_15',
+    16: 'UnkRotation_16',
 }
 
 
@@ -58,8 +99,25 @@ TRANSFORM_TYPE_MAP = {
 # Search callback for source_bone (populated from hash_list at import time)
 # ---------------------------------------------------------------------------
 
+def _update_flags_from_bits(self, context):
+    """Called when any flag_bit_N changes — repack into cns_flags."""
+    self['cns_flags'] = sum(int(getattr(self, f'flag_bit_{i}')) << i for i in range(8))
+
+
+def _update_bits_from_flags(self, context):
+    """Called when cns_flags changes — unpack into flag_bit_N."""
+    v = self.cns_flags & 0xFF
+    for i in range(8):
+        self[f'flag_bit_{i}'] = bool(v & (1 << i))
+
+
 def _search_bone_names(context, edit_text):
-    """Return bone names from available_bones_json that match edit_text (case-insensitive)."""
+    """Return bone names from available_bones_json that match edit_text (case-insensitive).
+
+    If the typed text is not already in the known list it is prepended as the
+    first suggestion so the user can confirm a brand-new bone name by pressing
+    Enter or clicking the first item, without being forced onto a partial match.
+    """
     import json
     obj = context.active_object
     if obj is None:
@@ -72,7 +130,10 @@ def _search_bone_names(context, edit_text):
     except Exception:
         return []
     needle = edit_text.lower()
-    return [n for n in names if needle in n.lower()]
+    matches = sorted(n for n in names if needle in n.lower())
+    if edit_text and edit_text not in names:
+        return [edit_text] + matches
+    return matches
 
 
 def _search_source_bone(self, context, edit_text):
@@ -99,14 +160,14 @@ class JCNSConstraintProperties(PropertyGroup):
         description="Driving bone name. Type to search bones available in this file's hash list.",
         default="",
         search=_search_source_bone,
-        search_options={'SUGGESTION', 'SORT'},
+        search_options={'SUGGESTION'},
     )
     target_bone: StringProperty(
         name="Target Bone",
         description="Driven bone name. Type to search bones available in this file's hash list.",
         default="",
         search=_search_target_bone,
-        search_options={'SUGGESTION', 'SORT'},
+        search_options={'SUGGESTION'},
     )
     transform_type: EnumProperty(
         name="Transform Type",
@@ -172,6 +233,101 @@ class JCNSConstraintProperties(PropertyGroup):
     rest_quat_z: FloatProperty(name="Quat Z", default=0.0, precision=5)
     rest_quat_w: FloatProperty(name="Quat W", default=1.0, precision=5)
 
+    # --- ConstraintInfo raw fields (editable, exported) ---
+    # flags_cns: editable int + 8 bit checkboxes (bidirectional sync via update callbacks)
+    cns_flags: IntProperty(
+        name="Flags", description="bt: flags_cns — 0x30 in all observed files",
+        default=0x30, min=0, max=255, update=_update_bits_from_flags,
+    )
+    flags_expanded: BoolProperty(name="展开 Flags", default=False)
+    flag_bit_0: BoolProperty(name="Bit0 — isAdd?",  default=False, update=_update_flags_from_bits)
+    flag_bit_1: BoolProperty(name="Bit1",            default=False, update=_update_flags_from_bits)
+    flag_bit_2: BoolProperty(name="Bit2",            default=False, update=_update_flags_from_bits)
+    flag_bit_3: BoolProperty(name="Bit3",            default=False, update=_update_flags_from_bits)
+    flag_bit_4: BoolProperty(name="Bit4 — isJoint?",default=True,  update=_update_flags_from_bits)
+    flag_bit_5: BoolProperty(name="Bit5",            default=True,  update=_update_flags_from_bits)
+    flag_bit_6: BoolProperty(name="Bit6",            default=False, update=_update_flags_from_bits)
+    flag_bit_7: BoolProperty(name="Bit7",            default=False, update=_update_flags_from_bits)
+    parent_vec4_x: FloatProperty(name="Vec4 X", default=0.0, precision=5)
+    parent_vec4_y: FloatProperty(name="Vec4 Y", default=0.0, precision=5)
+    parent_vec4_z: FloatProperty(name="Vec4 Z", default=0.0, precision=5)
+    parent_vec4_w: FloatProperty(name="Vec4 W", default=1.0, precision=5)
+    parent_float2_x: FloatProperty(name="Float2 X", default=0.0, precision=5)
+    parent_float2_y: FloatProperty(name="Float2 Y", default=0.0, precision=5)
+    parent_uint8_72: IntProperty(
+        name="UnknownUInt8 (+72)", description="ConstraintInfo byte at offset +72",
+        default=0, min=0, max=255,
+    )
+    property_hash: IntProperty(
+        name="PropertyHash", description="bt: PropertyHash — usually 0",
+        default=0, min=0,
+    )
+    cone_driver_info_count: IntProperty(
+        name="ConeDriverInfoCount", description="bt: ConeDriverInfoCount — usually 0",
+        default=0, min=0, max=255,
+    )
+    parent_tail_0: IntProperty(name="Tail[0]", default=0, min=0, max=255)
+    parent_tail_1: IntProperty(name="Tail[1]", default=0, min=0, max=255)
+    parent_tail_2: IntProperty(name="Tail[2]", default=0, min=0, max=255)
+    parent_tail_3: IntProperty(name="Tail[3]", default=0, min=0, max=255)
+    parent_tail_4: IntProperty(name="Tail[4]", default=0, min=0, max=255)
+    parent_tail_5: IntProperty(name="Tail[5]", default=0, min=0, max=255)
+
+    # --- ConstraintSource_v2 raw fields (editable, exported) ---
+    interpolation: EnumProperty(
+        name="Interpolation",
+        description="bt: InterpolationID — interpolation mode for the mapping curve",
+        items=INTERPOLATION_ITEMS,
+        default='FastInAndOut',
+    )
+    unk_byte0: IntProperty(
+        name="UnkByte0 (+24)", description="Source constant, always 3 in observed files",
+        default=3, min=0, max=255,
+    )
+    unk_byte2: IntProperty(
+        name="UnkByte2 (+27)", description="Source byte at offset +27, always 0",
+        default=0, min=0, max=255,
+    )
+    complex_mapping_info_count: IntProperty(
+        name="ComplexMappingInfoCount", description="bt: ComplexMappingInfoCount — usually 0",
+        default=0, min=0, max=65535,
+    )
+    unknown_uint16: IntProperty(
+        name="UnknownUInt16", description="Source uint16 at offset +22, always 0",
+        default=0, min=0, max=65535,
+    )
+    unknown_uint32_2: IntProperty(
+        name="UnknownUInt32 (+28)", description="Source uint32 at offset +28, always 0",
+        default=0, min=0,
+    )
+
+    # --- Material constraint-specific fields (populated at import, editable) ---
+    mat_name_hash: StringProperty(
+        name="MaterialNameHash",
+        description="Direct hash of the material name (hex uint32, e.g. 0x1A2B3C4D)",
+        default="0x00000000",
+    )
+    mat_property_hash: StringProperty(
+        name="MaterialPropertyHash",
+        description="Direct hash of the material property (hex uint32)",
+        default="0x00000000",
+    )
+    mat_transform_type_raw: IntProperty(
+        name="TransformationID",
+        description="Material TransformationID byte",
+        default=0, min=0, max=255,
+    )
+    mat_tail_0: IntProperty(name="MatTail[0]", default=0, min=0, max=255)
+    mat_tail_1: IntProperty(name="MatTail[1]", default=0, min=0, max=255)
+    mat_tail_2: IntProperty(name="MatTail[2]", default=0, min=0, max=255)
+
+    # --- Section type (set at import, read-only in UI) ---
+    constraint_type: StringProperty(
+        name="Constraint Type",
+        description="Section type from the JCNS file (e.g. 'Ranges', 'Aim', 'Skin'…)",
+        default='Ranges',
+    )
+
     # --- Driver state (runtime, not exported) ---
     driver_applied: BoolProperty(
         name="Driver Applied",
@@ -209,6 +365,25 @@ class JCNSRootProperties(PropertyGroup):
         name="Available Bones (JSON)",
         description="JSON list of bone names present in this file's hash_list (set at import, used for source_bone autocomplete)",
         default="[]",
+    )
+    cached_file_header: StringProperty(
+        name="Cached File Header",
+        description="Base64 of first 0xF0 bytes of source file — allows export without the source file present",
+        default="",
+    )
+    cached_section_table: StringProperty(
+        name="Cached Section Table",
+        description="Base64 of section table data from source file",
+        default="",
+    )
+    detected_game: EnumProperty(
+        name="Game",
+        description="Game this JCNS file belongs to (detected at import)",
+        items=[
+            ('MHW_WILDS', "MH Wilds (v102)", "Monster Hunter Wilds post-TU4"),
+            ('RE9',       "RE9 / PRAGMATA (v35)", "Resident Evil 9 / PRAGMATA"),
+        ],
+        default='MHW_WILDS',
     )
 
 
@@ -264,10 +439,13 @@ def get_constraint_empties(root_empty):
     collection search for legacy imports.
     Sorted by the numeric prefix '[N]' in their names.
     """
+    def _is_range(obj):
+        p = getattr(obj, 'jcns_cns_props', None)
+        return p and (p.constraint_type == 'Ranges' or p.constraint_type == '')
+
     empties = []
     for obj in root_empty.children:
-        cns_props = getattr(obj, 'jcns_cns_props', None)
-        if cns_props and cns_props.source_bone:
+        if _is_range(obj):
             empties.append(obj)
 
     # Fallback: flat collection search (legacy imports without parent-child hierarchy)
@@ -276,8 +454,7 @@ def get_constraint_empties(root_empty):
             for obj in coll.objects:
                 if obj == root_empty:
                     continue
-                cns_props = getattr(obj, 'jcns_cns_props', None)
-                if cns_props and cns_props.source_bone:
+                if _is_range(obj):
                     empties.append(obj)
 
     def _sort_key(obj):
@@ -292,10 +469,11 @@ def get_constraint_empties(root_empty):
     return sorted(empties, key=_sort_key)
 
 
-def make_constraint_empty_name(idx, source_bone, target_bone, target_axis):
+def make_constraint_empty_name(idx, source_bone, target_bone, target_axis, source_axis='X'):
     """Generate the canonical display name for a constraint Empty."""
-    ax = target_axis if isinstance(target_axis, str) else INT_TO_AXIS.get(target_axis, 'X')
-    return f"[{idx:02d}] {source_bone} → {target_bone or '???'} {ax}"
+    src_ax = source_axis if isinstance(source_axis, str) else INT_TO_AXIS.get(source_axis, 'X')
+    tgt_ax = target_axis if isinstance(target_axis, str) else INT_TO_AXIS.get(target_axis, 'X')
+    return f"[{idx:02d}] {source_bone} {src_ax} → {target_bone or '???'} {tgt_ax}"
 
 
 # ---------------------------------------------------------------------------

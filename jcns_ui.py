@@ -56,7 +56,7 @@ class JCNS_PT_Status(Panel):
         if kind is None:
             col = layout.column(align=True)
             col.label(text="No JCNS object selected.", icon='INFO')
-            col.label(text="Import a .jcns.102 file,")
+            col.label(text="Import a .jcns file (.102 / .35),")
             col.label(text="then select a JCNS Empty.")
             layout.separator()
             layout.operator("jcns.import_file", text="Import JCNS…", icon='IMPORT')
@@ -98,11 +98,13 @@ class JCNS_PT_Root(Panel):
         layout = self.layout
         obj, rp = get_jcns_root(context)
 
-        # File path (read-only display)
+        # File path + game/version (read-only display)
         box = layout.box()
         col = box.column(align=True)
         col.label(text="Source File:", icon='FILE')
         col.label(text=rp.source_filepath.split('\\')[-1].split('/')[-1])
+        _GAME_LABELS = {'MHW_WILDS': "MH Wilds (v102)", 'RE9': "RE9 / PRAGMATA (v35)"}
+        col.label(text=f"Game: {_GAME_LABELS.get(rp.detected_game, rp.detected_game)}", icon='WORLD')
 
         layout.separator()
 
@@ -164,6 +166,47 @@ class JCNS_PT_Constraint(Panel):
         from . import get_jcns_constraint
         layout = self.layout
         obj, p = get_jcns_constraint(context)
+
+        # --- Section type header ---
+        ctype = p.constraint_type or 'Ranges'
+        row_type = layout.row()
+        row_type.alert = (ctype != 'Ranges')
+        row_type.label(text=f"Section Type: {ctype}", icon='CONSTRAINT_BONE')
+        if ctype == 'JointExportGraph':
+            layout.separator()
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text="JointExportGraph Path", icon='FILE_FOLDER')
+            col.prop(p, "source_bone", text="Path")
+            return
+
+        if ctype == 'Material':
+            layout.separator()
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text="Joint Bone", icon='BONE_DATA')
+            row = col.row(align=True)
+            row.label(text="Joint:")
+            row.prop(p, "target_bone", text="")
+            col.separator()
+            col.label(text="Raw Fields", icon='PREFERENCES')
+            row2 = col.row(align=True)
+            row2.prop(p, "mat_name_hash",     text="NameHash")
+            row2.prop(p, "mat_property_hash", text="PropHash")
+            row3 = col.row(align=True)
+            row3.prop(p, "mat_transform_type_raw", text="TransformID")
+            row3.prop(p, "mat_tail_0", text="T0")
+            row3.prop(p, "mat_tail_1", text="T1")
+            row3.prop(p, "mat_tail_2", text="T2")
+            return
+
+        if ctype != 'Ranges':
+            layout.separator()
+            layout.label(text="Not supported yet.", icon='ERROR')
+            layout.label(text="Export will preserve this constraint unchanged.")
+            return
+
+        layout.separator()
 
         # --- Bone identity ---
         box = layout.box()
@@ -236,6 +279,66 @@ class JCNS_PT_Constraint(Panel):
         row_q.prop(p, "rest_quat_y", text="Y")
         row_q.prop(p, "rest_quat_z", text="Z")
         row_q.prop(p, "rest_quat_w", text="W")
+
+        layout.separator()
+
+        # --- Advanced: ConstraintInfo raw fields ---
+        box4 = layout.box()
+        box4.label(text="ConstraintInfo (Raw)", icon='PREFERENCES')
+        col4 = box4.column(align=True)
+        row_flags_hdr = col4.row(align=True)
+        row_flags_hdr.prop(p, "cns_flags", text="Flags")
+        icon = 'TRIA_DOWN' if p.flags_expanded else 'TRIA_RIGHT'
+        row_flags_hdr.prop(p, "flags_expanded", text="", icon=icon, emboss=False)
+        if p.flags_expanded:
+            bits_col = col4.column(align=True)
+            for attr, desc in (
+                ("flag_bit_0", "Bit0 — isAdd?"),
+                ("flag_bit_1", "Bit1"),
+                ("flag_bit_2", "Bit2"),
+                ("flag_bit_3", "Bit3"),
+                ("flag_bit_4", "Bit4 — isJoint?"),
+                ("flag_bit_5", "Bit5"),
+                ("flag_bit_6", "Bit6"),
+                ("flag_bit_7", "Bit7"),
+            ):
+                row_b = bits_col.row(align=True)
+                row_b.prop(p, attr, text="")
+                row_b.label(text=desc)
+        col4.label(text="UnknownVector4D:")
+        row_v4 = col4.row(align=True)
+        row_v4.prop(p, "parent_vec4_x", text="X")
+        row_v4.prop(p, "parent_vec4_y", text="Y")
+        row_v4.prop(p, "parent_vec4_z", text="Z")
+        row_v4.prop(p, "parent_vec4_w", text="W")
+        col4.label(text="UnknownFloat2:")
+        row_f2 = col4.row(align=True)
+        row_f2.prop(p, "parent_float2_x", text="X")
+        row_f2.prop(p, "parent_float2_y", text="Y")
+        row_misc = col4.row(align=True)
+        row_misc.prop(p, "parent_uint8_72", text="+72")
+        row_misc.prop(p, "property_hash",   text="PropHash")
+        row_misc.prop(p, "cone_driver_info_count", text="CDrvCnt")
+        col4.label(text="TailBytes [74..79]:")
+        row_tail = col4.row(align=True)
+        for attr in ("parent_tail_0","parent_tail_1","parent_tail_2",
+                     "parent_tail_3","parent_tail_4","parent_tail_5"):
+            row_tail.prop(p, attr, text="")
+
+        layout.separator()
+
+        # --- Advanced: ConstraintSource_v2 raw fields ---
+        box5 = layout.box()
+        box5.label(text="ConstraintSource (Raw)", icon='PREFERENCES')
+        col5 = box5.column(align=True)
+        col5.prop(p, "interpolation", text="Interpolation")
+        row_s = col5.row(align=True)
+        row_s.prop(p, "unk_byte0",  text="UnkByte0(+24)")
+        row_s.prop(p, "unk_byte2",  text="UnkByte2(+27)")
+        row_s2 = col5.row(align=True)
+        row_s2.prop(p, "complex_mapping_info_count", text="CplxMapCnt")
+        row_s2.prop(p, "unknown_uint16",             text="UInt16(+22)")
+        col5.prop(p, "unknown_uint32_2", text="UInt32(+28)")
 
         layout.separator()
 

@@ -68,7 +68,7 @@ def _build_hash_dict(armature_obj):
 
 def _strip_ext(filename):
     """Strip JCNS version suffixes: 'foo.jcns.102' → 'foo'."""
-    for ext in ('.102', '.29', '.jcns'):
+    for ext in ('.102', '.29', '.35', '.jcns'):
         if filename.endswith(ext):
             filename = filename[:-len(ext)]
     return filename
@@ -117,6 +117,29 @@ def do_import(filepath, context, armature_obj=None):
     if armature_obj:
         root.jcns_root_props.target_armature = armature_obj
 
+    # Detected game / version
+    from jcns_parser import VERSION_GAME_MAP
+    root.jcns_root_props.detected_game = VERSION_GAME_MAP.get(
+        parser.header.get('Version', 102), 'MHW_WILDS'
+    )
+
+    # Cache structural data needed for export without source file
+    import base64, struct as _struct
+    raw = parser.original_bytes
+    cns_info_start = parser.header.get('ConstraintSetsStart', 0xF0)
+    root.jcns_root_props.cached_file_header = base64.b64encode(raw[:cns_info_start]).decode('ascii')
+    orig_sec_off = _struct.unpack_from('<Q', raw, 0xB0)[0]
+    layout = parser.header.get('layout', {})
+    cb = layout.get('counts_base', 0xD0)
+    cf = layout.get('counts_fields', {'SectionCount': (0x1A, '<B')})
+    sc_off, sc_fmt = cf['SectionCount']
+    sec_count = _struct.unpack_from(sc_fmt, raw, cb + sc_off)[0]
+    if orig_sec_off > 0 and orig_sec_off + sec_count * 4 <= len(raw):
+        sec_data = raw[orig_sec_off : orig_sec_off + sec_count * 4]
+    else:
+        sec_data = b'\x00\x00\x00\x00'
+    root.jcns_root_props.cached_section_table = base64.b64encode(sec_data).decode('ascii')
+
     # Legacy custom property for easy Outliner tag
     root["jcns_source"] = filepath
 
@@ -142,7 +165,7 @@ def do_import(filepath, context, armature_obj=None):
         transform_str = TRANSFORM_TYPE_MAP.get(transform_int, 'Unknown')
 
         # Empty name
-        empty_name = make_constraint_empty_name(idx, source_bone, target_bone, tgt_ax_str)
+        empty_name = make_constraint_empty_name(idx, source_bone, target_bone, tgt_ax_str, src_ax_str)
 
         obj = bpy.data.objects.new(empty_name, None)
         obj.empty_display_type = 'ARROWS'
@@ -152,6 +175,7 @@ def do_import(filepath, context, armature_obj=None):
 
         # Populate JCNSConstraintProperties
         p = obj.jcns_cns_props
+        p.constraint_type = 'Ranges'
         p.source_bone    = source_bone
         p.target_bone    = target_bone
         p.transform_type = transform_str
@@ -171,6 +195,86 @@ def do_import(filepath, context, armature_obj=None):
         p.rest_quat_y = c.get('rest_quat_y', 0.0)
         p.rest_quat_z = c.get('rest_quat_z', 0.0)
         p.rest_quat_w = c.get('rest_quat_w', 1.0)
+
+        # ConstraintInfo raw fields — set cns_flags (update callback syncs the 8 bits)
+        p.cns_flags = c.get('Flags', 0x30)
+        vec4                    = c.get('ParentVec4', (0.0, 0.0, 0.0, 1.0))
+        p.parent_vec4_x, p.parent_vec4_y, p.parent_vec4_z, p.parent_vec4_w = vec4
+        f2                      = c.get('ParentFloat2', (0.0, 0.0))
+        p.parent_float2_x, p.parent_float2_y = f2
+        p.parent_uint8_72       = c.get('ParentUInt8_72', 0)
+        p.property_hash         = c.get('PropertyHash', 0)
+        p.cone_driver_info_count = c.get('ConeDriverInfoCount', 0)
+        tail = c.get('ParentTailBytes', b'\x00' * 6)
+        p.parent_tail_0, p.parent_tail_1, p.parent_tail_2 = tail[0], tail[1], tail[2]
+        p.parent_tail_3, p.parent_tail_4, p.parent_tail_5 = tail[3], tail[4], tail[5]
+
+        # ConstraintSource_v2 raw fields
+        from . import INT_TO_INTERPOLATION
+        interp_int              = c.get('Interpolation', 1)
+        p.interpolation         = INT_TO_INTERPOLATION.get(interp_int, 'FastInAndOut')
+        p.unk_byte0             = c.get('UnkByte0', 3)
+        p.unk_byte2             = c.get('UnkByte2', 0)
+        p.complex_mapping_info_count = c.get('ComplexMappingInfoCount', 0)
+        p.unknown_uint16        = c.get('UnknownUInt16', 0)
+        p.unknown_uint32_2      = c.get('UnknownUInt32_2', 0)
+
+    # --- Non-Range read-only Empties (Aim, RotExpression, Material, JointExportGraph) ---
+
+    for idx, ac in enumerate(parser.aim_constraints):
+        src_name = hash_dict.get(ac['JointHash'],  f"0x{ac['JointHash']:08X}")
+        tgt_name = hash_dict.get(ac['TargetHash'], f"0x{ac['TargetHash']:08X}")
+        obj = bpy.data.objects.new(f"[Aim{idx:02d}] {src_name} → {tgt_name}", None)
+        obj.empty_display_type = 'SPHERE'
+        obj.empty_display_size = 0.03
+        obj.parent = root
+        coll.objects.link(obj)
+        p2 = obj.jcns_cns_props
+        p2.constraint_type = 'Aim'
+        p2.source_bone = src_name
+        p2.target_bone = tgt_name
+
+    for idx, re in enumerate(parser.rot_expressions):
+        src_name = hash_dict.get(re['SourceJointHash'], f"0x{re['SourceJointHash']:08X}")
+        tgt_name = hash_dict.get(re['JointHash'],       f"0x{re['JointHash']:08X}")
+        obj = bpy.data.objects.new(f"[RotExpr{idx:02d}] {src_name} → {tgt_name}", None)
+        obj.empty_display_type = 'CIRCLE'
+        obj.empty_display_size = 0.03
+        obj.parent = root
+        coll.objects.link(obj)
+        p2 = obj.jcns_cns_props
+        p2.constraint_type = 'RotExpression'
+        p2.source_bone = src_name
+        p2.target_bone = tgt_name
+
+    for idx, mc in enumerate(parser.material_cns):
+        jnt_name = hash_dict.get(mc['JointHash'], f"0x{mc['JointHash']:08X}")
+        obj = bpy.data.objects.new(f"[Mat{idx:02d}] {jnt_name}", None)
+        obj.empty_display_type = 'CUBE'
+        obj.empty_display_size = 0.02
+        obj.parent = root
+        coll.objects.link(obj)
+        p2 = obj.jcns_cns_props
+        p2.constraint_type = 'Material'
+        p2.source_bone = jnt_name   # needed so get_jcns_constraint() recognises this empty
+        p2.target_bone = jnt_name
+        import struct as _ms
+        raw = mc['raw_body']        # 12 bytes: NameHash(4) + PropHash(4) + TransformID(1) + tail(3)
+        p2.mat_name_hash        = f"0x{_ms.unpack_from('<I', raw, 0)[0]:08X}"
+        p2.mat_property_hash    = f"0x{_ms.unpack_from('<I', raw, 4)[0]:08X}"
+        p2.mat_transform_type_raw = raw[8]
+        p2.mat_tail_0, p2.mat_tail_1, p2.mat_tail_2 = raw[9], raw[10], raw[11]
+
+    if parser.joint_export_graph is not None:
+        path = parser.joint_export_graph['path']
+        obj = bpy.data.objects.new(f"[JXG] {path or '(empty)'}", None)
+        obj.empty_display_type = 'IMAGE'
+        obj.empty_display_size = 0.02
+        obj.parent = root
+        coll.objects.link(obj)
+        p2 = obj.jcns_cns_props
+        p2.constraint_type = 'JointExportGraph'
+        p2.source_bone = path   # repurpose source_bone to hold the path for display
 
     # --- Populate available_bones_json from all bone names in hash_list ---
     # Collect every SourceName and TargetBoneName that was decoded from the file.
@@ -201,7 +305,7 @@ class JCNS_OT_ImportFile(Operator, ImportHelper):
     bl_options = {'REGISTER', 'UNDO'}
 
     filter_glob: StringProperty(
-        default="*.jcns.*;*.jcns.102;*.jcns.29",
+        default="*.jcns.102;*.jcns.29;*.jcns.35",
         options={'HIDDEN'},
     )
 
@@ -264,6 +368,21 @@ class JCNS_OT_ImportFile(Operator, ImportHelper):
 
 
 # ---------------------------------------------------------------------------
+# Drag-and-drop file handler (Blender 4.1+)
+# ---------------------------------------------------------------------------
+
+class JCNS_FH_ImportFile(bpy.types.FileHandler):
+    bl_idname = "JCNS_FH_import_file"
+    bl_label = "RE Engine JCNS"
+    bl_import_operator = "jcns.import_file"
+    bl_file_extensions = ".102;.29;.35"
+
+    @classmethod
+    def poll_drop(cls, context):
+        return context.area and context.area.type in {'VIEW_3D', 'OUTLINER'}
+
+
+# ---------------------------------------------------------------------------
 # Menu hook
 # ---------------------------------------------------------------------------
 
@@ -282,9 +401,13 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(_menu_import)
+    if bpy.app.version >= (4, 1, 0):
+        bpy.utils.register_class(JCNS_FH_ImportFile)
 
 
 def unregister():
+    if bpy.app.version >= (4, 1, 0):
+        bpy.utils.unregister_class(JCNS_FH_ImportFile)
     bpy.types.TOPBAR_MT_file_import.remove(_menu_import)
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
