@@ -314,7 +314,7 @@ def _patch_constraint_from_empty(parsed_c, empty_obj, hash_list):
 class JCNS_OT_ExportFile(Operator, ExportHelper):
     """Export the selected JCNS collection back to a .jcns.102 binary file"""
     bl_idname = "jcns.export_file"
-    bl_label  = "RE Engine JCNS (.jcns.102)"
+    bl_label  = "RE Engine JCNS (.jcns.*)"
     bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ""
@@ -330,8 +330,16 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
 
     def invoke(self, context, event):
         _, rp = _get_active_root(context)
-        if rp and rp.source_filepath:
-            self.filepath = bpy.path.abspath(rp.source_filepath)
+        if rp:
+            # Dynamically set the auto-append extension based on detected game version
+            if rp.detected_game == 'RE9':
+                self.filename_ext = ".jcns.35"
+            else:
+                self.filename_ext = ".jcns.102"
+
+            if rp.source_filepath:
+                self.filepath = bpy.path.abspath(rp.source_filepath)
+        
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -434,7 +442,7 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
 def _menu_export(self, context):
     obj, _ = _get_active_root(context)
     if obj is not None:
-        self.layout.operator(JCNS_OT_ExportFile.bl_idname, text="RE Engine JCNS (.jcns.102)")
+        self.layout.operator(JCNS_OT_ExportFile.bl_idname, text="RE Engine JCNS (.jcns.*)")
 
 
 # ---------------------------------------------------------------------------
