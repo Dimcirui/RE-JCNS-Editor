@@ -261,6 +261,109 @@ def _get_active_constraint_props(context):
 # Operator: Apply Single Driver
 # ---------------------------------------------------------------------------
 
+def refresh_channel_values(obj):
+    """Update an applied driver's anchors without rebuilding the driver.
+
+    Dragging a mapping value fires an update per mouse tick, and tearing the
+    F-Curve down and recreating it each time is far more work than is needed:
+    only the numbers in the channel table changed.  Structural edits (bone,
+    axis, transform type) still go through the full path, since those change the
+    driver's variables and its channel key.
+    """
+    from . import (get_jcns_root_from_constraint, group_constraints_by_channel,
+                   channel_key)
+    from . import jcns_drivers
+
+    p = getattr(obj, 'jcns_cns_props', None)
+    if p is None or not p.is_jcns_constraint or p.constraint_type != 'Ranges':
+        return False
+    if not p.driver_applied:
+        return False
+    root_obj, rp = get_jcns_root_from_constraint(obj)
+    if root_obj is None or rp is None or rp.target_armature is None:
+        return False
+    members = group_constraints_by_channel(root_obj).get(channel_key(p))
+    if not members:
+        return False
+
+    entry = _DRIVABLE.get(p.transform_type)
+    if entry is None:
+        return False
+    use_radians = entry[2]
+
+    maps = []
+    for e in members:
+        for s in _sources_for_driver(e.jcns_cns_props):
+            if not s['bone']:
+                continue
+            vals = (s['from_start'], s['from_kink'], s['from_end'],
+                    s['to_start'],   s['to_kink'],   s['to_end'])
+            maps.append(tuple(math.radians(v) for v in vals) if use_radians
+                        else tuple(vals))
+    if not maps:
+        return False
+
+    key = jcns_drivers.channel_id(rp.target_armature.name, p.target_bone,
+                                  p.transform_type, p.target_axis)
+    jcns_drivers.register_channel(key, maps, rp.source_combine)
+    rp.target_armature.update_tag()
+    return True
+
+
+
+def refresh_applied_driver(obj):
+    """Re-apply the driver for obj's channel if one is already on it.
+
+    The generated driver reads its anchors out of jcns_drivers._CHANNELS, which
+    is filled in at apply time, so editing a mapping value leaves the rig showing
+    the old curve until the user presses the button again.  Property update
+    callbacks route here so the viewport keeps up while numbers are being dragged.
+
+    Silent no-op when nothing is applied yet — this must never interrupt editing.
+    """
+    from . import (get_jcns_root_from_constraint, group_constraints_by_channel,
+                   channel_key, get_constraint_empties)
+
+    # Changing the file-level combine rule affects every applied channel.
+    rp = getattr(obj, 'jcns_root_props', None)
+    if rp is not None and rp.source_filepath:
+        if rp.target_armature is None:
+            return False
+        done = 0
+        for key, members in group_constraints_by_channel(obj).items():
+            if not any(e.jcns_cns_props.driver_applied for e in members):
+                continue
+            try:
+                ok, _e, _l = _apply_channel(rp.target_armature, rp, members)
+                done += bool(ok)
+            except Exception as exc:
+                print("[JCNS] auto-refresh failed: %r" % exc)
+        if done:
+            rp.target_armature.update_tag()
+        return bool(done)
+
+    p = getattr(obj, 'jcns_cns_props', None)
+    if p is None or not p.is_jcns_constraint or p.constraint_type != 'Ranges':
+        return False
+    if not p.driver_applied:
+        return False
+    root_obj, root_props = get_jcns_root_from_constraint(obj)
+    if root_obj is None or root_props is None or root_props.target_armature is None:
+        return False
+    members = group_constraints_by_channel(root_obj).get(channel_key(p))
+    if not members:
+        return False
+    try:
+        ok, _err, _label = _apply_channel(root_props.target_armature, root_props, members)
+    except Exception as exc:                      # never break the UI over this
+        print("[JCNS] auto-refresh failed: %r" % exc)
+        return False
+    if ok:
+        root_props.target_armature.update_tag()
+    return ok
+
+
+
 def _apply_channel(armature_obj, root_props, members):
     """Apply one merged driver for every constraint sharing a channel.
 
@@ -835,6 +938,59 @@ class JCNS_OT_SortAnchors(Operator):
         return {'FINISHED'}
 
 
+
+class JCNS_OT_ClearSingleDriver(Operator):
+    """清除此约束所在通道的驱动器
+
+    Blender 一个通道只能有一条驱动器，所以同一根骨骼同一个轴上的约束共用一条；
+    清除会一并影响它们，面板上会列出受影响的条目。
+    """
+    bl_idname = "jcns.clear_single_driver"
+    bl_label  = "清除驱动器"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        from . import get_jcns_constraint
+        obj, props = get_jcns_constraint(context)
+        return (obj is not None and props.constraint_type == 'Ranges'
+                and props.driver_applied)
+
+    def execute(self, context):
+        from . import (get_jcns_constraint, get_jcns_root_from_constraint,
+                       group_constraints_by_channel, channel_key, AXIS_TO_INT)
+        cns_obj, p = get_jcns_constraint(context)
+        root_obj, root_props = get_jcns_root_from_constraint(cns_obj)
+        arm = root_props.target_armature if root_props else None
+        if arm is None:
+            self.report({'ERROR'}, "未设置目标骨架。")
+            return {'CANCELLED'}
+
+        entry = _DRIVABLE.get(p.transform_type)
+        if entry is None:
+            self.report({'WARNING'}, "此变换类型没有对应的驱动器通道。")
+            return {'CANCELLED'}
+        data_path = entry[0]
+
+        pose_bone = arm.pose.bones.get(p.target_bone)
+        if pose_bone is not None:
+            try:
+                pose_bone.driver_remove(data_path, AXIS_TO_INT.get(p.target_axis, 0))
+            except Exception:
+                pass
+
+        members = group_constraints_by_channel(root_obj).get(channel_key(p), [cns_obj])
+        for e in members:
+            e.jcns_cns_props.driver_applied = False
+        arm.update_tag()
+
+        extra = ("，同通道另有 %d 条一并清除" % (len(members) - 1)
+                 if len(members) > 1 else "")
+        self.report({'INFO'}, "已清除 %s 的局部 %s 轴驱动器%s"
+                              % (p.target_bone, p.target_axis, extra))
+        return {'FINISHED'}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -849,6 +1005,7 @@ _classes = [
     JCNS_OT_RemoveSource,
     JCNS_OT_SwapMapToEnds,
     JCNS_OT_SortAnchors,
+    JCNS_OT_ClearSingleDriver,
     JCNS_OT_MirrorConstraints,
 ]
 

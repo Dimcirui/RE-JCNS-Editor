@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "re_jcns_editor"
-version = "0.11.0"
+version = "0.12.0"
 name = "RE Engine JCNS 编辑器"
 tagline = "导入、编辑并导出 RE Engine 关节约束文件"
 maintainer = "Dimcirui"

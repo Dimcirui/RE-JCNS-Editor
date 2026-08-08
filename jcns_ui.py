@@ -377,15 +377,28 @@ class JCNS_PT_Constraint(Panel):
                               label=("驱动源 %d" % p.active_source_index
                                      if len(p.sources) > 1 else None))
 
+        # Driver controls first, then tools, and only then the destructive one.
+        # The delete button used to sit as a bare trash icon beside "Apply
+        # Driver", where it read as "clear the driver" rather than "delete this
+        # constraint".
         layout.separator()
-        row = layout.row(align=True)
-        row.scale_y = 1.3
-        row.operator("jcns.apply_single_driver",
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator("jcns.apply_single_driver",
                      text="重新应用驱动器" if p.driver_applied else "应用驱动器",
                      icon='DRIVER')
-        row.operator("jcns.delete_constraint", text="", icon='TRASH')
+        sub = col.row(align=True)
+        sub.enabled = p.driver_applied
+        sub.operator("jcns.clear_single_driver", text="清除驱动器", icon='X')
+
+        layout.separator()
         layout.operator("jcns.mirror_constraints", text="镜像到另一侧…",
                         icon='MOD_MIRROR')
+
+        layout.separator()
+        danger = layout.row()
+        danger.alert = True
+        danger.operator("jcns.delete_constraint", text="删除此约束", icon='TRASH')
 
     def _draw_source(self, layout, p, sp, m, label=None):
         col = layout.column(align=True)

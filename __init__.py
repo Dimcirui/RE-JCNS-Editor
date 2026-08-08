@@ -13,7 +13,7 @@ from bpy.types import PropertyGroup
 bl_info = {
     "name": "RE Engine JCNS Editor",
     "author": "JCNS Reverse Engineering Project",
-    "version": (0, 11, 0),
+    "version": (0, 12, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > JCNS Editor | File > Import/Export",
     "description": (
@@ -117,6 +117,29 @@ def _update_bits_from_flags(self, context):
         self[f'flag_bit_{i}'] = bool(v & (1 << i))
 
 
+def _refresh_driver_values(self, context):
+    """Cheap path: only the numbers changed, so the driver itself can stay."""
+    try:
+        from . import jcns_operators
+        jcns_operators.refresh_channel_values(self.id_data)
+    except Exception as exc:
+        print("[JCNS] driver value refresh skipped: %r" % exc)
+
+
+def _refresh_driver(self, context):
+    """Keep an already-applied driver in step with the value being edited.
+
+    Without this the rig keeps showing the curve as it was when Apply was last
+    pressed, because the driver reads anchors baked into the channel table.
+    Does nothing when no driver is applied, so it costs nothing while authoring.
+    """
+    try:
+        from . import jcns_operators
+        jcns_operators.refresh_applied_driver(self.id_data)
+    except Exception as exc:                     # an edit must never hard-fail
+        print("[JCNS] driver refresh skipped: %r" % exc)
+
+
 def _search_bone_names(context, edit_text):
     """Return bone names from available_bones_json that match edit_text (case-insensitive).
 
@@ -164,6 +187,7 @@ class JCNSSourceProperties(PropertyGroup):
     """
 
     source_bone: StringProperty(
+        update=_refresh_driver,
         name="驱动骨骼",
         description="读取旋转的骨骼。可输入以搜索本文件哈希表中的骨骼名",
         default="",
@@ -171,6 +195,7 @@ class JCNSSourceProperties(PropertyGroup):
         search_options={'SUGGESTION'},
     )
     source_axis: EnumProperty(
+        update=_refresh_driver,
         name="源局部轴向",
         description="读取驱动骨骼的哪个局部轴。JCNS 的映射定义在骨骼自身的局部坐标系上，不是全局坐标系",
         items=AXIS_ITEMS,
@@ -179,26 +204,32 @@ class JCNSSourceProperties(PropertyGroup):
 
     # --- Three-point piecewise mapping ---
     from_start: FloatProperty(
+        update=_refresh_driver_values,
         name="From 起点", description="MapFrom 点A — 第一段起始锚点（源角度，单位度）",
         default=0.0, precision=2, step=10,
     )
     from_kink: FloatProperty(
+        update=_refresh_driver_values,
         name="From 折点", description="MapFrom 点B — 两段斜率的分界折点（源角度，单位度）",
         default=0.0, precision=2, step=10,
     )
     from_end: FloatProperty(
+        update=_refresh_driver_values,
         name="From 终点", description="MapFrom 点C — 第二段终止锚点，源骨骼最大偏转角（单位度）",
         default=0.0, precision=2, step=10,
     )
     to_start: FloatProperty(
+        update=_refresh_driver_values,
         name="To 起点", description="MapTo 点A — 对应 from_start 的输出值",
         default=0.0, precision=2, step=10,
     )
     to_kink: FloatProperty(
+        update=_refresh_driver_values,
         name="To 折点", description="MapTo 点B — 折点处的输出值（引擎读取此值）",
         default=0.0, precision=2, step=10,
     )
     to_end: FloatProperty(
+        update=_refresh_driver_values,
         name="To 终点", description="MapTo 点C — 目标骨骼最大输出旋转量（单位度）",
         default=0.0, precision=2, step=10,
     )
@@ -266,6 +297,7 @@ class JCNSConstraintProperties(PropertyGroup):
 
     # --- Identity ---
     target_bone: StringProperty(
+        update=_refresh_driver,
         name="目标骨骼",
         description="被驱动的骨骼。可输入以搜索本文件哈希表中的骨骼名",
         default="",
@@ -273,6 +305,7 @@ class JCNSConstraintProperties(PropertyGroup):
         search_options={'SUGGESTION'},
     )
     transform_type: EnumProperty(
+        update=_refresh_driver,
         name="变换类型",
         description="约束驱动的是旋转、平移还是缩放等",
         items=TRANSFORM_ITEMS,
@@ -281,6 +314,7 @@ class JCNSConstraintProperties(PropertyGroup):
 
     # --- Axis (editable — exported back to file) ---
     target_axis: EnumProperty(
+        update=_refresh_driver,
         name="目标局部轴向",
         description="驱动目标骨骼的哪个局部轴。JCNS 的映射定义在骨骼自身的局部坐标系上，不是全局坐标系",
         items=AXIS_ITEMS,
@@ -410,6 +444,7 @@ class JCNSRootProperties(PropertyGroup):
         default="",
     )
     source_combine: EnumProperty(
+        update=_refresh_driver,
         name="多源合并",
         description=(
             "How several mapped outputs driving the SAME bone axis are folded into "
