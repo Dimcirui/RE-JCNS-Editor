@@ -439,6 +439,16 @@ class JCNS_PT_Constraint(Panel):
         src = sp.source_bone or "驱动骨"
         tgt = p.target_bone or "目标骨"
 
+        if d.get('unreachable_anchor'):
+            warn = col.column(align=True)
+            warn.alert = True
+            warn.label(text="锚点顺序折返，终点 %s 永远取不到"
+                            % d['unreachable_anchor'], icon='ERROR')
+            warn.label(text="改它不会有任何效果 —— 三个源角度需按大小排列")
+            warn.operator("jcns.sort_anchors", text="按源角度排序锚点",
+                          icon='SORTSIZE')
+            col.separator()
+
         if d['inert']:
             col.label(text="此约束恒无输出（输出锚点全为 0）", icon='RADIOBUT_OFF')
             return

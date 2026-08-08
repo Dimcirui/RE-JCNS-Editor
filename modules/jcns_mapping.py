@@ -184,35 +184,89 @@ def plain_description(source, unit="°"):
     at_rest = eval_piecewise(fs, fk, fe, ts, tk, te, 0.0)
     inert = abs(ts) < 1e-9 and abs(tk) < 1e-9 and abs(te) < 1e-9
 
-    # Anchors as (input, output), de-duplicated and ordered by input.
-    anchors = sorted({round(x, 6): y for x, y in
-                      ((fs, ts), (fk, tk), (fe, te))}.items())
+    # The three anchors do not have to be ordered, and when they double back
+    # (say [-120, 0, -30]) one of them becomes unreachable: the transfer
+    # function picks a segment by which side of the kink the input is on, so a
+    # segment lying on the same side as its neighbour is never evaluated.
+    #
+    # Describing the curve by sorting the anchors and joining the dots would
+    # therefore report behaviour the rig does not have.  Sample the real
+    # function instead and read the shape back off it, so this can only ever
+    # describe what eval_piecewise — and hence the driver — actually does.
+    lo, hi = min(0.0, fs, fk, fe), max(0.0, fs, fk, fe)
+    if hi - lo < 1e-9:
+        return {'rest_output': at_rest, 'legs': [], 'inert': inert,
+                'offset_at_rest': abs(at_rest) > 1e-4,
+                'anchors_ordered': True, 'unreachable_anchor': None}
+
+    n = 401
+    step = (hi - lo) / (n - 1)
+    pts = [(lo + i * step, eval_piecewise(fs, fk, fe, ts, tk, te, lo + i * step))
+           for i in range(n)]
+
+    # Merge samples into straight runs; a slope change starts a new run.
+    runs = []
+    i = 0
+    while i < len(pts) - 1:
+        x0, y0 = pts[i]
+        j = i + 1
+        slope = (pts[j][1] - y0) / (pts[j][0] - x0)
+        while j < len(pts) - 1:
+            nxt = (pts[j + 1][1] - y0) / (pts[j + 1][0] - x0)
+            if abs(nxt - slope) > 1e-4 * max(1.0, abs(slope)):
+                break
+            slope = nxt
+            j += 1
+        runs.append((x0, pts[j][0], y0, pts[j][1]))
+        i = j
+
+    # Sampling puts a breakpoint on the nearest sample rather than exactly on
+    # the anchor, so 25 would be reported as 24.9.  Snap back to the real value.
+    def snap(x):
+        for a in (0.0, fs, fk, fe):
+            if abs(x - a) <= step * 1.5:
+                return a
+        return x
+
+    runs = [(snap(x0), snap(x1),
+             eval_piecewise(fs, fk, fe, ts, tk, te, snap(x0)),
+             eval_piecewise(fs, fk, fe, ts, tk, te, snap(x1)))
+            for x0, x1, y0, y1 in runs]
 
     legs = []
     for direction in (+1, -1):
-        beyond = [(x, y) for x, y in anchors
-                  if (x > 1e-6 if direction > 0 else x < -1e-6)]
-        if not beyond:
-            continue
-        if direction < 0:
-            beyond = list(reversed(beyond))          # walk away from zero
         steps = []
-        prev_x, prev_y = 0.0, at_rest
-        for x, y in beyond:
-            kind = 'dead' if abs(y - prev_y) < 1e-6 else 'move'
-            steps.append((prev_x, x, prev_y, y, kind))
-            prev_x, prev_y = x, y
-        # collapse consecutive legs that behave identically
-        merged = []
-        for st in steps:
-            if merged and merged[-1][4] == st[4] == 'dead':
-                merged[-1] = (merged[-1][0], st[1], merged[-1][2], st[3], 'dead')
+        ordered = runs if direction > 0 else list(reversed(runs))
+        for x0, x1, y0, y1 in ordered:
+            a, b = (x0, x1) if direction > 0 else (x1, x0)
+            u, v = (y0, y1) if direction > 0 else (y1, y0)
+            if (b <= 1e-6) if direction > 0 else (b >= -1e-6):
+                continue                       # entirely on the other side
+            a = max(a, 0.0) if direction > 0 else min(a, 0.0)
+            if abs(b - a) < 1e-6:
+                continue                       # zero-width run at a breakpoint
+            u = eval_piecewise(fs, fk, fe, ts, tk, te, a)
+            kind = 'dead' if abs(v - u) < 1e-4 else 'move'
+            if steps and steps[-1][4] == kind == 'dead':
+                steps[-1] = (steps[-1][0], b, steps[-1][2], v, 'dead')
             else:
-                merged.append(st)
-        legs.append({'direction': direction, 'steps': merged})
+                steps.append((a, b, u, v, kind))
+        if steps:
+            legs.append({'direction': direction, 'steps': steps})
+
+    # Which anchor, if any, the function never reaches.
+    unreachable = None
+    ordered_anchors = (fs <= fk <= fe) or (fs >= fk >= fe)
+    if not ordered_anchors:
+        for name, ax, ay in (('A', fs, ts), ('B', fk, tk), ('C', fe, te)):
+            if abs(eval_piecewise(fs, fk, fe, ts, tk, te, ax) - ay) > 1e-4:
+                unreachable = name
+                break
 
     return {'rest_output': at_rest, 'legs': legs, 'inert': inert,
-            'offset_at_rest': abs(at_rest) > 1e-4}
+            'offset_at_rest': abs(at_rest) > 1e-4,
+            'anchors_ordered': ordered_anchors,
+            'unreachable_anchor': unreachable}
 
 
 def sample(source, n=48):

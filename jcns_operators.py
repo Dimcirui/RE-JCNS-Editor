@@ -795,6 +795,46 @@ class JCNS_OT_MirrorConstraints(Operator):
         return {'FINISHED'}
 
 
+
+class JCNS_OT_SortAnchors(Operator):
+    """把三个锚点按源角度重新排序
+
+    锚点折返时（例如 [-120, 0, -30]），映射按「输入在折点哪一侧」选择线段，
+    于是有一个锚点永远取不到 —— 改它不会有任何效果。排序会把每个输出和它自己
+    的输入一起搬动，曲线形状因此保持不变，只是所有锚点重新可用。
+    """
+    bl_idname = "jcns.sort_anchors"
+    bl_label  = "按源角度排序锚点"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        from . import get_jcns_constraint
+        obj, props = get_jcns_constraint(context)
+        return (obj is not None and props.constraint_type == 'Ranges'
+                and len(props.sources) > 0)
+
+    def execute(self, context):
+        from . import get_jcns_constraint
+        from .modules_shim import get_mapping
+        _, p = get_jcns_constraint(context)
+        sp = p.sources[min(p.active_source_index, len(p.sources) - 1)]
+
+        pairs = sorted(((sp.from_start, sp.to_start),
+                        (sp.from_kink,  sp.to_kink),
+                        (sp.from_end,   sp.to_end)), key=lambda t: t[0])
+        # keep the file's own direction: a descending MapFrom stays descending
+        if sp.from_start > sp.from_end:
+            pairs.reverse()
+        (sp.from_start, sp.to_start), (sp.from_kink, sp.to_kink),             (sp.from_end, sp.to_end) = pairs
+
+        d = get_mapping().plain_description(sp)
+        self.report({'INFO'}, "锚点已排序：%s" % (
+            "全部可用" if d['unreachable_anchor'] is None
+            else "仍有锚点 %s 取不到" % d['unreachable_anchor']))
+        return {'FINISHED'}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -808,6 +848,7 @@ _classes = [
     JCNS_OT_AddSource,
     JCNS_OT_RemoveSource,
     JCNS_OT_SwapMapToEnds,
+    JCNS_OT_SortAnchors,
     JCNS_OT_MirrorConstraints,
 ]
 

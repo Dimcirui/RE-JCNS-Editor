@@ -13,7 +13,7 @@ from bpy.types import PropertyGroup
 bl_info = {
     "name": "RE Engine JCNS Editor",
     "author": "JCNS Reverse Engineering Project",
-    "version": (0, 10, 0),
+    "version": (0, 11, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > JCNS Editor | File > Import/Export",
     "description": (
