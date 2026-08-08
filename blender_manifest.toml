@@ -1,0 +1,37 @@
+schema_version = "1.0.0"
+
+id = "re_jcns_editor"
+version = "0.10.0"
+name = "RE Engine JCNS 编辑器"
+tagline = "导入、编辑并导出 RE Engine 关节约束文件"
+maintainer = "Dimcirui"
+type = "add-on"
+
+website = "https://github.com/Dimcirui/RE-JCNS-Editor"
+
+tags = ["Animation", "Import-Export", "Rigging"]
+
+blender_version_min = "4.2.0"
+
+# Blender add-ons link against bpy and are distributed under a GPL-compatible
+# licence by convention; this also matches NSACloud's RE Engine add-ons, whose
+# structure this project follows.
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read and write .jcns joint constraint files"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/.gitignore",
+  "/tests/",
+  "/build_addon.py",
+  "/*.zip",
+  "/*.bt",
+  "/session_notes.md",
+  "/codebase_specification.md",
+  "/modules/pattern_finder.py",
+  "/modules/test_out.jcns",
+]
