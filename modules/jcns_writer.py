@@ -71,12 +71,26 @@ class JCNSWriter:
             e.g. BlendShape / property targets that don't live in the hash table."""
             return c.get('TargetHashIndex', 0) == 0xFFFFFFFF
 
+        def _target_hash(c):
+            """Hash to store in ObjectHash for a direct-hash (non-indexed) target.
+
+            Normally this is the MurmurHash of ObjectName.  But ObjectName can be an
+            RSZ object or property target (e.g. 'via.motion.Chain') whose ObjectHash is
+            derived from something else — recomputing it there would corrupt the field,
+            so the parser records whether the two agreed in the original file.
+            """
+            name = c.get('TargetBoneName', '')
+            if name and c.get('ObjectHashMatchesName', True):
+                return hashUTF16(name) & 0xFFFFFFFF
+            return c.get('ObjectHash', 0)
+
+
         # Rebuild hashes for all source and target bones (Range constraints)
         for c in p.constraints:
-            src = c.get('SourceName', '')
-            if src:
-                src_h, src_idx = _get_or_add(src)
-                c['SourceHashIndex'] = src_idx
+            for s in c.get('sources', []):
+                if s.get('SourceName'):
+                    _, src_idx = _get_or_add(s['SourceName'])
+                    s['SourceHashIndex'] = src_idx
 
             # Only bone targets go into the hash table; BlendShape/property targets
             # use direct ObjectHash (TgtIdx=0xFFFFFFFF) and must not pollute the list.
@@ -136,45 +150,68 @@ class JCNSWriter:
         SRC_START = _align(raw_src_start, 16)
 
         # ── Phase 3: build ConstraintSource_v2 blobs ───────────────────
+        # Layout per constraint (matches shipped multi-source files, e.g.
+        # ch02_027_0002 where L_Foot/R_Foot sit at 0x140/0x188 with both name
+        # strings pooled afterwards at 0x1D0/0x1DE):
+        #
+        #     [Source_v2 #0][Source_v2 #1]…[name #0][name #1]…[pad to 8]
+        #
+        # Writing each name directly after its own struct — as this code used to —
+        # puts the string exactly where the engine expects Source_v2 #1, which
+        # corrupts every constraint with SourceCount > 1.
         src_blob      = bytearray()
-        src_offsets   = []  # absolute file offset of each 72-byte Source_v2 struct
+        src_offsets   = []  # absolute offset of each constraint's Source_v2 array (0 = none)
 
         for c in p.constraints:
-            # Align each Source_v2 to 16-byte boundary
+            srcs = c.get('sources', [])
+            if not srcs:
+                # SourceCount == 0 (e.g. BlendShape targets): emit nothing and leave
+                # OffsetSourceList null rather than inventing a phantom source block.
+                src_offsets.append(0)
+                continue
+
+            # Align the array to a 16-byte boundary
             abs_base = SRC_START + len(src_blob)
             pad = _align(abs_base, 16) - abs_base
             src_blob.extend(b'\x00' * pad)
             abs_base += pad
-
-            abs_name = abs_base + 72          # WString immediately follows struct
             src_offsets.append(abs_base)
 
-            block = bytearray(72)
-            struct.pack_into('<Q', block,  0, c.get('ComplexMappingInfoOffset', 0))
-            struct.pack_into('<Q', block,  8, abs_name)
-            struct.pack_into('<I', block, 16, c.get('SourceHashIndex', 0))
-            struct.pack_into('<H', block, 20, c.get('ComplexMappingInfoCount', 0))
-            struct.pack_into('<H', block, 22, c.get('UnknownUInt16', 0))
-            block[24] = c.get('UnkByte0', 3)
-            block[25] = c.get('Interpolation', 1)
-            block[26] = c.get('source_axis', 0) # bt: SourceAxis
-            block[27] = c.get('UnkByte2', 0)
-            struct.pack_into('<I', block, 28, c.get('UnknownUInt32_2', 0))
-            struct.pack_into('<f', block, 32, c.get('from_start',  0.0))
-            struct.pack_into('<f', block, 36, c.get('from_kink',   0.0))
-            struct.pack_into('<f', block, 40, c.get('from_end',    0.0))
-            struct.pack_into('<f', block, 44, c.get('to_start',    0.0))
-            struct.pack_into('<f', block, 48, c.get('to_kink',     0.0))
-            struct.pack_into('<f', block, 52, c.get('to_end',      0.0))
-            struct.pack_into('<f', block, 56, c.get('rest_quat_x', 0.0))
-            struct.pack_into('<f', block, 60, c.get('rest_quat_y', 0.0))
-            struct.pack_into('<f', block, 64, c.get('rest_quat_z', 0.0))
-            struct.pack_into('<f', block, 68, c.get('rest_quat_w', 1.0))
-            src_blob.extend(block)
+            # Name strings live after all the structs; compute their offsets first.
+            names_start = abs_base + 72 * len(srcs)
+            name_blob = bytearray()
+            name_offsets = []
+            for s in srcs:
+                name_offsets.append(names_start + len(name_blob))
+                name_blob.extend(s.get('SourceName', '').encode('utf-16le') + b'\x00\x00')
+                if len(name_blob) % 2:
+                    name_blob.extend(b'\x00')
 
-            # Source WString (UTF-16LE, null-terminated, 8-byte aligned)
-            wstr = c.get('SourceName', '').encode('utf-16le') + b'\x00\x00'
-            src_blob.extend(wstr)
+            for s, abs_name in zip(srcs, name_offsets):
+                block = bytearray(72)
+                struct.pack_into('<Q', block,  0, s.get('ComplexMappingInfoOffset', 0))
+                struct.pack_into('<Q', block,  8, abs_name)
+                struct.pack_into('<I', block, 16, s.get('SourceHashIndex', 0))
+                struct.pack_into('<H', block, 20, s.get('ComplexMappingInfoCount', 0))
+                struct.pack_into('<H', block, 22, s.get('UnknownUInt16', 0))
+                block[24] = s.get('UpdateTiming', 3)
+                block[25] = s.get('SrcTransformID', 3)
+                block[26] = s.get('source_axis', 0)   # bt: SourceAxis
+                block[27] = s.get('UnkByte2', 0)
+                struct.pack_into('<I', block, 28, s.get('UnknownUInt32_2', 0))
+                struct.pack_into('<f', block, 32, s.get('from_start',  0.0))
+                struct.pack_into('<f', block, 36, s.get('from_kink',   0.0))
+                struct.pack_into('<f', block, 40, s.get('from_end',    0.0))
+                struct.pack_into('<f', block, 44, s.get('to_start',    0.0))
+                struct.pack_into('<f', block, 48, s.get('to_kink',     0.0))
+                struct.pack_into('<f', block, 52, s.get('to_end',      0.0))
+                struct.pack_into('<f', block, 56, s.get('rest_quat_x', 0.0))
+                struct.pack_into('<f', block, 60, s.get('rest_quat_y', 0.0))
+                struct.pack_into('<f', block, 64, s.get('rest_quat_z', 0.0))
+                struct.pack_into('<f', block, 68, s.get('rest_quat_w', 1.0))
+                src_blob.extend(block)
+
+            src_blob.extend(name_blob)
             rem = (SRC_START + len(src_blob)) % 8
             if rem:
                 src_blob.extend(b'\x00' * (8 - rem))
@@ -205,32 +242,43 @@ class JCNSWriter:
         DEP_PAD_SIZE   = 8
         DEP_TABLE_START = TGT_POOL_START + len(tgt_pool_blob) + DEP_PAD_SIZE
 
-        # Collect unique (target_hash, source_hash) pairs.
+        # bt: DependencyInfo = {uint64 Offset, uint64 SourceCount}, and at Offset
+        #     {hash ObjectHash; hash SourceHash[SourceCount]}.
+        # So one entry per driven object, carrying all of its source hashes — NOT one
+        # entry per (target, source) pair.  Checked against 358 shipped files: 297 have
+        # DependencyCount == number of distinct target objects (and real entries carry
+        # SourceCount up to 6), while only 2 match the one-entry-per-pair reading.
         # Always derive target hash from the name so renamed bones get correct hashes.
-        dep_pairs = []
-        seen_pairs = set()
+        dep_order = []            # target hashes, in first-seen order
+        dep_sources = {}          # target hash -> list of source hashes (unique, ordered)
         for c in p.constraints:
             tgt_name = c.get('TargetBoneName', '')
             if _is_direct_hash(c):
-                tgt_h = hashUTF16(tgt_name) & 0xFFFFFFFF if tgt_name else c.get('ObjectHash', 0)
+                tgt_h = _target_hash(c)
             else:
                 tgt_h, _ = _get_or_add(tgt_name)
-            src_idx = c.get('SourceHashIndex', 0)
-            src_h = new_hash_list[src_idx] if src_idx < len(new_hash_list) else 0
-            pair = (tgt_h, src_h)
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                dep_pairs.append(pair)
+            if tgt_h not in dep_sources:
+                dep_sources[tgt_h] = []
+                dep_order.append(tgt_h)
+            bucket = dep_sources[tgt_h]
+            for s in c.get('sources', []):
+                src_idx = s.get('SourceHashIndex', 0)
+                src_h = new_hash_list[src_idx] if src_idx < len(new_hash_list) else 0
+                if src_h not in bucket:
+                    bucket.append(src_h)
 
-        M = len(dep_pairs)
+        M = len(dep_order)
         DEP_DATA_START = DEP_TABLE_START + M * 16
 
         dep_table_blob = bytearray()
         dep_data_blob  = bytearray()
-        for i, (tgt_h, src_h) in enumerate(dep_pairs):
-            data_offset = DEP_DATA_START + i * 8
-            dep_table_blob.extend(struct.pack('<QQ', data_offset, 1))
-            dep_data_blob.extend(struct.pack('<II', tgt_h, src_h))
+        for tgt_h in dep_order:
+            srcs_h = dep_sources[tgt_h]
+            data_offset = DEP_DATA_START + len(dep_data_blob)
+            dep_table_blob.extend(struct.pack('<QQ', data_offset, len(srcs_h)))
+            dep_data_blob.extend(struct.pack('<I', tgt_h))
+            for h in srcs_h:
+                dep_data_blob.extend(struct.pack('<I', h))
 
         # ── Phase 6: build SectionTable ────────────────────────────────
         SEC_TABLE_START = DEP_DATA_START + len(dep_data_blob)
@@ -261,7 +309,7 @@ class JCNSWriter:
             tgt_name    = c.get('TargetBoneName', '')
             tgt_name_off = tgt_name_to_offset.get(tgt_name, 0)
             if _is_direct_hash(c):
-                tgt_h   = hashUTF16(tgt_name) & 0xFFFFFFFF if tgt_name else c.get('ObjectHash', 0)
+                tgt_h   = _target_hash(c)
                 tgt_idx = 0xFFFFFFFF
             else:
                 tgt_h, tgt_idx = _get_or_add(tgt_name)
@@ -275,7 +323,9 @@ class JCNSWriter:
             struct.pack_into('<I', block, 36, tgt_h)            # ObjectHash
             struct.pack_into('<I', block, 40, c.get('PropertyHash', 0))
             block[44] = c.get('ConeDriverInfoCount', 0)
-            block[45] = c.get('SourceCount_parent', 1)
+            # Derived from the source list, never copied — a stale SourceCount is
+            # exactly what made multi-source constraints read past their own data.
+            block[45] = len(c.get('sources', []))
             block[46] = c.get('Flags', 0x30)
             block[47] = c.get('TransformType', 1)
             vec4 = c.get('ParentVec4', (0.0, 0.0, 0.0, 1.0))
@@ -451,7 +501,7 @@ class JCNSWriter:
         """
         v35 passthrough: preserve the inline blob (ConeDriverInfo + Source_v2 structs +
         embedded WStrings + gap data) verbatim, patching only the editable Source_v2 fields
-        (mapping floats, axes, rest_quat, interpolation).  Hash list and all pointers are
+        (mapping floats, axes, rest_quat, raw source bytes).  Hash list and all pointers are
         kept from the original file, so the output is byte-identical to the source except
         for fields the user changed.
         """
@@ -466,24 +516,25 @@ class JCNSWriter:
             src_ptr = c.get('LimitsPointer', 0)
             if src_ptr == 0:
                 continue
-            off = src_ptr - cns_end
-            if off < 0 or off + 72 > len(patched_blob):
-                continue
-            patched_blob[off + 24] = c.get('UnkByte0', 3)
-            patched_blob[off + 25] = c.get('Interpolation', 1)
-            patched_blob[off + 26] = c.get('source_axis', 0)
-            patched_blob[off + 27] = c.get('UnkByte2', 0)
-            struct.pack_into('<I', patched_blob, off + 28, c.get('UnknownUInt32_2', 0))
-            struct.pack_into('<f', patched_blob, off + 32, c.get('from_start',  0.0))
-            struct.pack_into('<f', patched_blob, off + 36, c.get('from_kink',   0.0))
-            struct.pack_into('<f', patched_blob, off + 40, c.get('from_end',    0.0))
-            struct.pack_into('<f', patched_blob, off + 44, c.get('to_start',    0.0))
-            struct.pack_into('<f', patched_blob, off + 48, c.get('to_kink',     0.0))
-            struct.pack_into('<f', patched_blob, off + 52, c.get('to_end',      0.0))
-            struct.pack_into('<f', patched_blob, off + 56, c.get('rest_quat_x', 0.0))
-            struct.pack_into('<f', patched_blob, off + 60, c.get('rest_quat_y', 0.0))
-            struct.pack_into('<f', patched_blob, off + 64, c.get('rest_quat_z', 0.0))
-            struct.pack_into('<f', patched_blob, off + 68, c.get('rest_quat_w', 1.0))
+            for k, s in enumerate(c.get('sources', [])):
+                off = (src_ptr - cns_end) + k * 72
+                if off < 0 or off + 72 > len(patched_blob):
+                    continue
+                patched_blob[off + 24] = s.get('UpdateTiming', 3)
+                patched_blob[off + 25] = s.get('SrcTransformID', 3)
+                patched_blob[off + 26] = s.get('source_axis', 0)
+                patched_blob[off + 27] = s.get('UnkByte2', 0)
+                struct.pack_into('<I', patched_blob, off + 28, s.get('UnknownUInt32_2', 0))
+                struct.pack_into('<f', patched_blob, off + 32, s.get('from_start',  0.0))
+                struct.pack_into('<f', patched_blob, off + 36, s.get('from_kink',   0.0))
+                struct.pack_into('<f', patched_blob, off + 40, s.get('from_end',    0.0))
+                struct.pack_into('<f', patched_blob, off + 44, s.get('to_start',    0.0))
+                struct.pack_into('<f', patched_blob, off + 48, s.get('to_kink',     0.0))
+                struct.pack_into('<f', patched_blob, off + 52, s.get('to_end',      0.0))
+                struct.pack_into('<f', patched_blob, off + 56, s.get('rest_quat_x', 0.0))
+                struct.pack_into('<f', patched_blob, off + 60, s.get('rest_quat_y', 0.0))
+                struct.pack_into('<f', patched_blob, off + 64, s.get('rest_quat_z', 0.0))
+                struct.pack_into('<f', patched_blob, off + 68, s.get('rest_quat_w', 1.0))
 
         # ── Rebuild ConstraintInfo with original pointers/hashes ────────
         cns_info_blob = bytearray()
@@ -497,7 +548,7 @@ class JCNSWriter:
             struct.pack_into('<I', block, 36, c.get('ObjectHash', 0))
             struct.pack_into('<I', block, 40, c.get('PropertyHash', 0))
             block[44] = c.get('ConeDriverInfoCount', 0)
-            block[45] = c.get('SourceCount_parent', 1)
+            block[45] = len(c.get('sources', []))
             block[46] = c.get('Flags', 0x30)
             block[47] = c.get('TransformType', 1)
             vec4 = c.get('ParentVec4', (0.0, 0.0, 0.0, 1.0))

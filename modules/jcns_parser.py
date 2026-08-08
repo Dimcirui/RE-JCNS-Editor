@@ -1,5 +1,6 @@
 import struct
 import os
+import sys
 
 # Version-specific layout constants.  DataEntry pointer offsets (0x50–0xC0) are
 # identical for all supported versions; only the counts region and ConstraintInfo
@@ -48,6 +49,15 @@ LAYOUTS = {
 VERSION_GAME_MAP = {102: 'MHW_WILDS', 35: 'RE9'}
 
 
+def _hash_utf16(name):
+    """MurmurHash3 of a UTF-16LE bone name, as RE Engine computes it."""
+    hashing_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hashing')
+    if hashing_dir not in sys.path:
+        sys.path.insert(0, hashing_dir)
+    from mmh3.pymmh3 import hashUTF16
+    return hashUTF16(name) & 0xFFFFFFFF
+
+
 class JCNSParser:
     """
     Parser for RE Engine JCNS v102 files.
@@ -61,7 +71,8 @@ class JCNSParser:
       +36:  ObjectHash            uint32   direct target bone hash (redundant with above)
       +40:  PropertyHash          uint32   property hash
       +44:  ConeDriverInfoCount   uint8    bt: ConeDriverInfoCount
-      +45:  SourceCount           uint8    number of sources (usually 1)
+      +45:  SourceCount           uint8    number of ConstraintSource_v2 blocks; ~12% of
+                                             constraints have more than 1 (up to 8 observed)
       +46:  Flags                 uint8    bt: flags_cns  — 0x30 in all observed files
       +47:  TransformType         uint8    bt: TransformationID  0=Translation 1=Rotation 2=Scale …
       +48:  UnknownVector4D       vec4     [0,0,0,1] (quaternion identity at rest)
@@ -76,8 +87,13 @@ class JCNSParser:
       +16:  SourceHashIndex           uint32   index into hash_list → source bone hash
       +20:  ComplexMappingInfoCount   uint16   bt: ComplexMappingInfoCount (0 in all observed)
       +22:  UnknownUInt16             uint16   = 0 in all observed files
-      +24:  UnkByte0                  uint8    constant 3 in all observed files; NOT an axis
-      +25:  Interpolation             uint8    bt: InterpolationID  1=FastInAndOut in all observed
+      +24:  UpdateTiming              uint8    bt(0.65.14): UpdateTimingID.  Observed {0,1,2,3},
+                                              matching MotionBegin/MotionEnd/ConstraintBegin/ConstraintEnd.
+      +25:  SrcTransformID            uint8    MEANING UNCERTAIN — bt 0.65.13 called this
+                                              InterpolationID, bt 0.65.14 renamed it to
+                                              TransformIDSrc; the template author marks both
+                                              "Not sure".  Observed values are only {1, 3}, and
+                                              +25==3 occurs iff +24==3.  Treated as a raw byte.
       +26:  source_axis               uint8    bt: SourceAxis  0=X 1=Y 2=Z 3=W
       +27:  UnkByte2                  uint8    = 0 in all observed files
       +28:  UnknownUInt32_2      uint32   = 0
@@ -109,7 +125,7 @@ class JCNSParser:
 
     AXIS_NAMES = ['X', 'Y', 'Z', 'W']
     TRANSFORM_NAMES = {
-        0: 'Location', 1: 'Rotation', 2: 'Scale', 3: 'BlendShape',
+        0: 'Translation', 1: 'Rotation', 2: 'Scale', 3: 'BlendShape',
         4: 'UnkCtrl_4', 5: 'UnkTopBank_5', 7: 'Material_Color',
         8: 'Material_4D', 9: 'Material_3D', 10: 'Material_2D',
         11: 'Scalar',
@@ -393,14 +409,35 @@ class JCNSParser:
             # Resolve target bone name
             c['TargetBoneName'] = self._read_wstring(data, obj_name_off)
             c['TargetBoneNameOffset'] = obj_name_off
+
+            # Does ObjectHash actually correspond to ObjectName?
+            #
+            # For ordinary bones it does.  But ObjectName can also be an RSZ object
+            # or property target (e.g. 'via.motion.Chain' with TransformType=11 and a
+            # non-zero PropertyHash), where ObjectHash is derived from something else
+            # entirely.  Recomputing the hash from the name in those cases silently
+            # rewrites it to a wrong value, so record the answer while both fields
+            # are still original and let the writer decide.
+            c['ObjectHashMatchesName'] = bool(
+                c['TargetBoneName']
+                and (_hash_utf16(c['TargetBoneName']) == c['ObjectHash'])
+            )
             if 0 <= c['TargetHashIndex'] < len(self.hash_list):
                 c['TargetHash'] = self.hash_list[c['TargetHashIndex']]
             else:
                 c['TargetHash'] = c['ObjectHash']
 
-            # --- 72-byte ConstraintSource_v2 ---
-            src = self._parse_source_struct(data, src_list_ptr)
-            c.update(src)
+            # --- ConstraintSource_v2 array: SourceCount consecutive 72-byte blocks ---
+            # bt: ConstraintSourceList reads CSource[SourceCount] at OffsetSourceList.
+            # Multi-source constraints are common (≈12% of all constraints observed),
+            # e.g. C_Spine_MB_XYZ_HJ driven by Spine_0 + Spine_1 + Spine_2.
+            c['sources'] = []
+            if src_list_ptr:
+                for k in range(c['SourceCount_parent']):
+                    c['sources'].append(
+                        self._parse_source_struct(data, src_list_ptr + k * 72)
+                    )
+
             # target_axis = TransformAxis from ConstraintInfo[+73], not from source block
             c['target_axis'] = c['TransformAxis_parent']
 
@@ -408,18 +445,21 @@ class JCNSParser:
 
         # Print summary
         for i, c in enumerate(self.constraints):
-            sa = self.AXIS_NAMES[min(c.get('source_axis', 0), 3)]
             ta = self.AXIS_NAMES[min(c.get('target_axis', 0), 3)]
-            print(
-                f"[{i:02d}] source={c.get('SourceName','?'):<14} "
-                f"targetHashIdx={c['TargetHashIndex']}  "
-                f"targetHash32=0x{c['TargetHash']:08x}  "
-                f"srcAxis={sa}({c.get('source_axis',0)})  "
-                f"tgtAxis={ta}({c.get('target_axis',0)})  "
-                + (f"From=[{c['from_start']}, kink={c['from_kink']}, {c['from_end']}] "
-                   f"To=[{c['to_start']}, kink={c['to_kink']}, {c['to_end']}]"
-                   if 'from_start' in c else "(no source)")
-            )
+            head = (f"[{i:02d}] target={c.get('TargetBoneName','?'):<20} "
+                    f"tgtAxis={ta}  hashIdx={c['TargetHashIndex']}  "
+                    f"hash32=0x{c['TargetHash']:08x}")
+            if not c['sources']:
+                print(head + "  (no sources)")
+                continue
+            print(f"{head}  << {len(c['sources'])} source(s)")
+            for k, s in enumerate(c['sources']):
+                sa = self.AXIS_NAMES[min(s.get('source_axis', 0), 3)]
+                print(
+                    f"       src[{k}] {s.get('SourceName','?'):<16} axis={sa}  "
+                    f"From=[{s.get('from_start')}, kink={s.get('from_kink')}, {s.get('from_end')}] "
+                    f"To=[{s.get('to_start')}, kink={s.get('to_kink')}, {s.get('to_end')}]"
+                )
 
     def _store_inline_blob(self, data):
         """
@@ -442,13 +482,20 @@ class JCNSParser:
 
     def _parse_source_struct(self, data, ptr):
         """Parse the 72-byte ConstraintSource_v2 starting at ptr."""
-        s = {}
         if ptr == 0 or ptr + 72 > len(data):
-            s['SourceName'] = ''
-            s['SourceHashIndex'] = 0
-            s['source_axis'] = 0
-            s['target_axis'] = 0
-            return s
+            # Fully-populated defaults so downstream code never sees a missing key.
+            return {
+                'SourceName': '', 'SourceName_Offset': 0, 'SourceHashIndex': 0,
+                'source_axis': 0, 'ComplexMappingInfoOffset': 0,
+                'ComplexMappingInfoCount': 0, 'UnknownUInt16': 0,
+                'UpdateTiming': 3, 'SrcTransformID': 3, 'UnkByte2': 0,
+                'UnknownUInt32_2': 0,
+                'from_start': 0.0, 'from_kink': 0.0, 'from_end': 0.0,
+                'to_start': 0.0, 'to_kink': 0.0, 'to_end': 0.0,
+                'rest_quat_x': 0.0, 'rest_quat_y': 0.0,
+                'rest_quat_z': 0.0, 'rest_quat_w': 1.0,
+            }
+        s = {}
 
         block = data[ptr:ptr + 72]
         s['ComplexMappingInfoOffset'] = struct.unpack_from('<Q', block, 0)[0]
@@ -458,10 +505,10 @@ class JCNSParser:
         s['ComplexMappingInfoCount']  = struct.unpack_from('<H', block, 20)[0]
         s['UnknownUInt16']            = struct.unpack_from('<H', block, 22)[0]
 
-        # +24: unknown constant (always 3); +25: InterpolationID (always 1=FastInAndOut)
+        # +24: UpdateTimingID (observed 0..3); +25: meaning uncertain, see class docstring
         # +26: SourceAxis (0=X 1=Y 2=Z 3=W); +27: unknown (always 0)
-        s['UnkByte0']    = block[24]
-        s['Interpolation'] = block[25]
+        s['UpdateTiming']   = block[24]
+        s['SrcTransformID'] = block[25]
         s['source_axis'] = block[26]
         s['UnkByte2']    = block[27]
 
