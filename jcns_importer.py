@@ -81,7 +81,8 @@ def _strip_ext(filename):
 def do_import(filepath, context, armature_obj=None):
     """
     Parse the JCNS file and build the collection hierarchy.
-    Returns (root_empty, count, error_str).  error_str is '' on success.
+    Returns (root_empty, count, error_str, warnings).  error_str is '' on success;
+    warnings is a list of strings describing structures that cannot be exported.
     """
     from . import (
         AXIS_TO_INT, INT_TO_AXIS, TRANSFORM_TYPE_MAP,
@@ -94,7 +95,14 @@ def do_import(filepath, context, armature_obj=None):
         parser = JCNSParser(filepath)
         constraints = parser.parse()
     except Exception as exc:
-        return None, 0, f"Parser error: {exc}"
+        return None, 0, f"解析失败：{exc}", []
+
+    # Surface unsupported structures now, rather than after the user has edited
+    # the file and discovered at export time that it cannot be written back.
+    from jcns_validate import check_exportable
+    warnings = check_exportable(parser)
+    for w in warnings:
+        print(f"[JCNS IMPORT] WARNING: {w}")
 
     # Build hash → bone-name dict if an armature was supplied
     hash_dict = _build_hash_dict(armature_obj) if armature_obj else {}
@@ -145,7 +153,7 @@ def do_import(filepath, context, armature_obj=None):
 
     # --- Create one child Empty per constraint ---
     for idx, c in enumerate(constraints):
-        source_bone = c.get('SourceName', '')
+        file_sources = c.get('sources', [])
         target_bone_name_from_file = c.get('TargetBoneName', '')
 
         # Resolve target bone name: try name from WStringOffset first, then hash lookup
@@ -154,18 +162,18 @@ def do_import(filepath, context, armature_obj=None):
             tgt_hash = c.get('TargetHash', 0)
             target_bone = hash_dict.get(tgt_hash, '')
 
-        # Axis values
-        src_ax_int = min(c.get('source_axis', 0), 3)
-        tgt_ax_int = min(c.get('target_axis', 0), 3)
-        src_ax_str = INT_TO_AXIS.get(src_ax_int, 'X')
-        tgt_ax_str = INT_TO_AXIS.get(tgt_ax_int, 'X')
+        tgt_ax_str = INT_TO_AXIS.get(min(c.get('target_axis', 0), 3), 'X')
 
         # Transform type
         transform_int = c.get('TransformType', 1)
         transform_str = TRANSFORM_TYPE_MAP.get(transform_int, 'Unknown')
 
-        # Empty name
-        empty_name = make_constraint_empty_name(idx, source_bone, target_bone, tgt_ax_str, src_ax_str)
+        first = file_sources[0] if file_sources else {}
+        empty_name = make_constraint_empty_name(
+            idx, first.get('SourceName', ''), target_bone, tgt_ax_str,
+            INT_TO_AXIS.get(min(first.get('source_axis', 0), 3), 'X'),
+            max(0, len(file_sources) - 1),
+        )
 
         obj = bpy.data.objects.new(empty_name, None)
         obj.empty_display_type = 'ARROWS'
@@ -175,26 +183,35 @@ def do_import(filepath, context, armature_obj=None):
 
         # Populate JCNSConstraintProperties
         p = obj.jcns_cns_props
+        p.is_jcns_constraint = True
         p.constraint_type = 'Ranges'
-        p.source_bone    = source_bone
         p.target_bone    = target_bone
         p.transform_type = transform_str
-        p.source_axis    = src_ax_str
         p.target_axis    = tgt_ax_str
 
-        # Three-point piecewise mapping — all values in degrees (file stores degrees directly)
-        p.from_start     = c.get('from_start',     0.0)
-        p.from_kink      = c.get('from_kink',      0.0)
-        p.from_end       = c.get('from_end',       0.0)
-        p.to_start       = c.get('to_start',       0.0)
-        p.to_kink        = c.get('to_kink',        0.0)
-        p.to_end         = c.get('to_end',         0.0)
-
-        # Rest-pose quaternion
-        p.rest_quat_x = c.get('rest_quat_x', 0.0)
-        p.rest_quat_y = c.get('rest_quat_y', 0.0)
-        p.rest_quat_z = c.get('rest_quat_z', 0.0)
-        p.rest_quat_w = c.get('rest_quat_w', 1.0)
+        # One entry per ConstraintSource_v2 block in the file
+        p.sources.clear()
+        for s in file_sources:
+            sp = p.sources.add()
+            sp.source_bone = s.get('SourceName', '')
+            sp.source_axis = INT_TO_AXIS.get(min(s.get('source_axis', 0), 3), 'X')
+            # mapping values are degrees; the file stores degrees directly
+            sp.from_start  = s.get('from_start', 0.0)
+            sp.from_kink   = s.get('from_kink',  0.0)
+            sp.from_end    = s.get('from_end',   0.0)
+            sp.to_start    = s.get('to_start',   0.0)
+            sp.to_kink     = s.get('to_kink',    0.0)
+            sp.to_end      = s.get('to_end',     0.0)
+            sp.rest_quat_x = s.get('rest_quat_x', 0.0)
+            sp.rest_quat_y = s.get('rest_quat_y', 0.0)
+            sp.rest_quat_z = s.get('rest_quat_z', 0.0)
+            sp.rest_quat_w = s.get('rest_quat_w', 1.0)
+            sp.update_timing    = s.get('UpdateTiming', 3)
+            sp.src_transform_id = s.get('SrcTransformID', 3)
+            sp.unk_byte2        = s.get('UnkByte2', 0)
+            sp.complex_mapping_info_count = s.get('ComplexMappingInfoCount', 0)
+            sp.unknown_uint16   = s.get('UnknownUInt16', 0)
+            sp.unknown_uint32_2 = s.get('UnknownUInt32_2', 0)
 
         # ConstraintInfo raw fields — set cns_flags (update callback syncs the 8 bits)
         p.cns_flags = c.get('Flags', 0x30)
@@ -209,15 +226,6 @@ def do_import(filepath, context, armature_obj=None):
         p.parent_tail_0, p.parent_tail_1, p.parent_tail_2 = tail[0], tail[1], tail[2]
         p.parent_tail_3, p.parent_tail_4, p.parent_tail_5 = tail[3], tail[4], tail[5]
 
-        # ConstraintSource_v2 raw fields
-        from . import INT_TO_INTERPOLATION
-        interp_int              = c.get('Interpolation', 1)
-        p.interpolation         = INT_TO_INTERPOLATION.get(interp_int, 'FastInAndOut')
-        p.unk_byte0             = c.get('UnkByte0', 3)
-        p.unk_byte2             = c.get('UnkByte2', 0)
-        p.complex_mapping_info_count = c.get('ComplexMappingInfoCount', 0)
-        p.unknown_uint16        = c.get('UnknownUInt16', 0)
-        p.unknown_uint32_2      = c.get('UnknownUInt32_2', 0)
 
     # --- Non-Range read-only Empties (Aim, RotExpression, Material, JointExportGraph) ---
 
@@ -230,8 +238,8 @@ def do_import(filepath, context, armature_obj=None):
         obj.parent = root
         coll.objects.link(obj)
         p2 = obj.jcns_cns_props
+        p2.is_jcns_constraint = True
         p2.constraint_type = 'Aim'
-        p2.source_bone = src_name
         p2.target_bone = tgt_name
 
     for idx, re in enumerate(parser.rot_expressions):
@@ -243,8 +251,8 @@ def do_import(filepath, context, armature_obj=None):
         obj.parent = root
         coll.objects.link(obj)
         p2 = obj.jcns_cns_props
+        p2.is_jcns_constraint = True
         p2.constraint_type = 'RotExpression'
-        p2.source_bone = src_name
         p2.target_bone = tgt_name
 
     for idx, mc in enumerate(parser.material_cns):
@@ -255,8 +263,8 @@ def do_import(filepath, context, armature_obj=None):
         obj.parent = root
         coll.objects.link(obj)
         p2 = obj.jcns_cns_props
+        p2.is_jcns_constraint = True
         p2.constraint_type = 'Material'
-        p2.source_bone = jnt_name   # needed so get_jcns_constraint() recognises this empty
         p2.target_bone = jnt_name
         import struct as _ms
         raw = mc['raw_body']        # 12 bytes: NameHash(4) + PropHash(4) + TransformID(1) + tail(3)
@@ -273,8 +281,9 @@ def do_import(filepath, context, armature_obj=None):
         obj.parent = root
         coll.objects.link(obj)
         p2 = obj.jcns_cns_props
+        p2.is_jcns_constraint = True
         p2.constraint_type = 'JointExportGraph'
-        p2.source_bone = path   # repurpose source_bone to hold the path for display
+        p2.jxg_path = path
 
     # --- Populate available_bones_json from all bone names in hash_list ---
     # Collect every SourceName and TargetBoneName that was decoded from the file.
@@ -283,15 +292,16 @@ def do_import(filepath, context, armature_obj=None):
     import json
     all_bone_names = set()
     for c in constraints:
-        src = c.get('SourceName', '').strip()
         tgt = c.get('TargetBoneName', '').strip()
-        if src:
-            all_bone_names.add(src)
         if tgt:
             all_bone_names.add(tgt)
+        for s_ in c.get('sources', []):
+            src = s_.get('SourceName', '').strip()
+            if src:
+                all_bone_names.add(src)
     root.jcns_root_props.available_bones_json = json.dumps(sorted(all_bone_names))
 
-    return root, len(constraints), ''
+    return root, len(constraints), '', warnings
 
 
 # ---------------------------------------------------------------------------
@@ -311,20 +321,20 @@ class JCNS_OT_ImportFile(Operator, ImportHelper):
 
     # Armature selection (EnumProperty because PointerProperty is invalid on Operators)
     target_armature_name: EnumProperty(
-        name="Target Armature",
-        description="Select the skeleton to resolve target bone names at import",
+        name="目标骨架",
+        description="导入时用于把哈希还原成骨骼名的骨架",
         items=_get_armature_items,
     )
 
     resolve_hashes: BoolProperty(
-        name="Resolve Target Bones",
-        description="Try to resolve TargetHash values to bone names via the selected armature",
+        name="解析目标骨骼名",
+        description="尝试用所选骨架把 TargetHash 还原成骨骼名",
         default=True,
     )
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="JCNS Import Options", icon='SETTINGS')
+        layout.label(text="JCNS 导入选项", icon='SETTINGS')
         layout.separator()
         layout.prop(self, "resolve_hashes")
         col = layout.column()
@@ -334,23 +344,28 @@ class JCNS_OT_ImportFile(Operator, ImportHelper):
     def execute(self, context):
         filepath = self.filepath
         if not os.path.isfile(filepath):
-            self.report({'ERROR'}, f"File not found: {filepath}")
+            self.report({'ERROR'}, f"找不到文件：{filepath}")
             return {'CANCELLED'}
 
         armature_obj = None
         if self.resolve_hashes and self.target_armature_name != "NONE":
             armature_obj = context.scene.objects.get(self.target_armature_name)
 
-        root, count, err = do_import(filepath, context, armature_obj)
+        root, count, err, warnings = do_import(filepath, context, armature_obj)
         if err:
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
 
-        arm_label = armature_obj.name if armature_obj else "none"
-        self.report(
-            {'INFO'},
-            f"Imported JCNS: {count} constraint(s) → '{root.name}' (armature: {arm_label})"
-        )
+        arm_label = armature_obj.name if armature_obj else "无"
+        summary = f"已导入 {count} 条约束 → 「{root.name}」（骨架：{arm_label}）"
+        if warnings:
+            self.report(
+                {'WARNING'},
+                f"{summary} —— 发现 {len(warnings)} 处不支持的结构，此文件无法导出，"
+                "详见系统控制台。"
+            )
+        else:
+            self.report({'INFO'}, summary)
         # Select the root Empty
         bpy.ops.object.select_all(action='DESELECT')
         root.select_set(True)

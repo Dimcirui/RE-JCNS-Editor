@@ -74,8 +74,9 @@ def _build_stub_parser(root_props, empties):
 
     for empty in empties:
         p = empty.jcns_cns_props
-        _add_name(p.source_bone)
         _add_name(p.target_bone)
+        for s in p.sources:
+            _add_name(s.source_bone)
 
     # Reconstruct original_bytes stub: header block + section table at its offset
     tags = base64.b64decode(root_props.cached_file_header)
@@ -135,7 +136,7 @@ def _sync_non_range_to_parser(root_obj, parser):
 
         if ctype == 'JointExportGraph':
             if parser.joint_export_graph is not None:
-                parser.joint_export_graph['path'] = p.source_bone
+                parser.joint_export_graph['path'] = p.jxg_path
 
         elif ctype == 'Material':
             # Extract index from name "[MatNN] …"
@@ -198,7 +199,6 @@ def _make_default_constraint_dict(empty_obj):
         'PropertyOffset':        0,
         'PropertyHash':          0,
         'ConeDriverInfoCount':   0,
-        'SourceCount_parent':    1,
         'Flags':                 0x30,
         'TransformType':         _TRANSFORM_STR_TO_INT.get(p.transform_type, 1),
         'ParentVec4':            (0.0, 0.0, 0.0, 1.0),
@@ -206,24 +206,9 @@ def _make_default_constraint_dict(empty_obj):
         'ParentUInt8_72':        0,
         'TransformAxis_parent':  tgt_ax,
         'ParentTailBytes':       b'\x00' * 6,
-        # ConstraintSource_v2 preserved fields
-        'ComplexMappingInfoOffset': 0,
-        'ComplexMappingInfoCount':  0,
-        'UnknownUInt16':            0,
-        'UnkByte0':          3,
-        'Interpolation':     1,
-        'UnkByte2':          0,
-        'UnknownUInt32_2':   0,
-        # Editable fields (overwritten by _patch_constraint_from_empty)
-        'SourceName':       '',
-        'SourceHashIndex':  0,
-        'TargetBoneName':   '',
-        'source_axis':      0,    # → ConstraintSource_v2[+26]
-        # target_axis → TransformAxis_parent (ConstraintInfo[+73]), set above
-        'from_start':       0.0, 'from_kink':  0.0, 'from_end':  0.0,
-        'to_start':         0.0, 'to_kink':    0.0, 'to_end':    0.0,
-        'rest_quat_x':      0.0, 'rest_quat_y': 0.0,
-        'rest_quat_z':      0.0, 'rest_quat_w': 1.0,
+        'TargetBoneName':        '',
+        # Sources are built entirely by _patch_constraint_from_empty()
+        'sources':               [],
     }
 
 
@@ -239,53 +224,65 @@ def _patch_constraint_from_empty(parsed_c, empty_obj, hash_list):
     TargetHash and TargetHashIndex from the name automatically.
     """
     from . import AXIS_TO_INT
+    _ensure_modules_path()
+    try:
+        from hashing.mmh3.pymmh3 import hashUTF16
+    except Exception:
+        hashUTF16 = None
     p = empty_obj.jcns_cns_props
 
-    # --- Source bone name ---
-    new_source_name = p.source_bone.strip()
-    if new_source_name:
-        _ensure_modules_path()
-        try:
-            from hashing.mmh3.pymmh3 import hashUTF16
-            new_hash = hashUTF16(new_source_name) & 0xFFFFFFFF
-            found_idx = next(
-                (i for i, h in enumerate(hash_list) if h == new_hash),
-                None
-            )
-            parsed_c['SourceName'] = new_source_name
-            if found_idx is not None:
-                parsed_c['SourceHashIndex'] = found_idx
-                print(f"[JCNS EXPORT] source_bone '{new_source_name}' "
-                      f"→ hash 0x{new_hash:08x} → hash_list[{found_idx}]")
-            else:
-                # Hash not in existing list — writer will append it
-                print(f"[JCNS EXPORT] source_bone '{new_source_name}' "
-                      f"hash 0x{new_hash:08x} will be appended to hash_list")
-        except Exception as exc:
-            print(f"[JCNS WARN ] Could not compute hash for '{new_source_name}': {exc}")
-
-    # --- Target bone name ---
+    # --- Target bone name (writer recomputes TargetHash/TargetHashIndex from it) ---
     new_target_name = p.target_bone.strip()
     if new_target_name:
-        # Writer derives TargetHash/TargetHashIndex from this name automatically
         parsed_c['TargetBoneName'] = new_target_name
 
-    # --- Axes and mapping values ---
-    parsed_c['source_axis']          = AXIS_TO_INT.get(p.source_axis, 0)
+    # --- Target axis lives in ConstraintInfo[+73], not in any source block ---
     parsed_c['TransformAxis_parent'] = AXIS_TO_INT.get(p.target_axis, 0)
-    parsed_c['from_start']   = p.from_start
-    parsed_c['from_kink']    = p.from_kink
-    parsed_c['from_end']     = p.from_end
-    parsed_c['to_start']     = p.to_start
-    parsed_c['to_kink']      = p.to_kink
-    parsed_c['to_end']       = p.to_end
-    parsed_c['rest_quat_x']  = p.rest_quat_x
-    parsed_c['rest_quat_y']  = p.rest_quat_y
-    parsed_c['rest_quat_z']  = p.rest_quat_z
-    parsed_c['rest_quat_w']  = p.rest_quat_w
+
+    # --- Sources: rebuild the whole list from the UI collection ---
+    # Rebuilding rather than patching in place means added/removed sources are
+    # handled for free, and SourceCount can never disagree with the actual data.
+    old_sources = parsed_c.get('sources', [])
+    new_sources = []
+    for i, sp in enumerate(p.sources):
+        # Carry over opaque fields from the matching original source when there is one
+        base = dict(old_sources[i]) if i < len(old_sources) else {'ComplexMappingInfoOffset': 0}
+        name = sp.source_bone.strip()
+        base['SourceName'] = name
+        base.setdefault('SourceHashIndex', 0)
+        if name and hashUTF16 is not None:
+            h = hashUTF16(name) & 0xFFFFFFFF
+            found = next((j for j, hv in enumerate(hash_list) if hv == h), None)
+            if found is not None:
+                base['SourceHashIndex'] = found   # else: writer appends the new hash
+        base['source_axis']     = AXIS_TO_INT.get(sp.source_axis, 0)
+        base['from_start']      = sp.from_start
+        base['from_kink']       = sp.from_kink
+        base['from_end']        = sp.from_end
+        base['to_start']        = sp.to_start
+        base['to_kink']         = sp.to_kink
+        base['to_end']          = sp.to_end
+        base['rest_quat_x']     = sp.rest_quat_x
+        base['rest_quat_y']     = sp.rest_quat_y
+        base['rest_quat_z']     = sp.rest_quat_z
+        base['rest_quat_w']     = sp.rest_quat_w
+        base['UpdateTiming']    = sp.update_timing
+        base['SrcTransformID']  = sp.src_transform_id
+        base['UnkByte2']        = sp.unk_byte2
+        base['UnknownUInt16']   = sp.unknown_uint16
+        base['UnknownUInt32_2'] = sp.unknown_uint32_2
+        base['ComplexMappingInfoCount'] = sp.complex_mapping_info_count
+        new_sources.append(base)
+    parsed_c['sources'] = new_sources
+
 
     # --- ConstraintInfo raw fields ---
-    parsed_c['Flags'] = p.cns_flags & 0xFF
+    # Bits 4 and 5 are redundant with the transform type (unanimous across all
+    # 19884 shipped constraints), so recompute them rather than trusting the raw
+    # field — otherwise changing a constraint's transform type would silently
+    # leave the flags describing the old one.
+    from .modules_shim import get_flags
+    parsed_c['Flags'] = get_flags().apply_derived_bits(p.cns_flags, p.transform_type)
     parsed_c['ParentVec4']          = (p.parent_vec4_x, p.parent_vec4_y,
                                        p.parent_vec4_z, p.parent_vec4_w)
     parsed_c['ParentFloat2']        = (p.parent_float2_x, p.parent_float2_y)
@@ -296,15 +293,6 @@ def _patch_constraint_from_empty(parsed_c, empty_obj, hash_list):
         p.parent_tail_0, p.parent_tail_1, p.parent_tail_2,
         p.parent_tail_3, p.parent_tail_4, p.parent_tail_5,
     ])
-
-    # --- ConstraintSource_v2 raw fields ---
-    from . import INTERPOLATION_TO_INT
-    parsed_c['Interpolation']            = INTERPOLATION_TO_INT.get(p.interpolation, 1)
-    parsed_c['UnkByte0']                 = p.unk_byte0
-    parsed_c['UnkByte2']                 = p.unk_byte2
-    parsed_c['ComplexMappingInfoCount']  = p.complex_mapping_info_count
-    parsed_c['UnknownUInt16']            = p.unknown_uint16
-    parsed_c['UnknownUInt32_2']          = p.unknown_uint32_2
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +311,8 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
         options={'HIDDEN'},
     )
     clean_hashes: BoolProperty(
-        name="Remove Redundant Hashes",
-        description="Delete hashes that are no longer used by any constraints. If unchecked, all original hashes are preserved",
+        name="清除冗余哈希",
+        description="删除已无约束引用的哈希。不勾选则保留原文件的全部哈希",
         default=False
     )
 
@@ -366,7 +354,7 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
 
         root_obj, root_props = _get_active_root(context)
         if root_obj is None:
-            self.report({'ERROR'}, "No JCNS root Empty detected. Select the JCNS collection root.")
+            self.report({'ERROR'}, "未检测到 JCNS 根节点，请先选中 JCNS 集合的根空物体。")
             return {'CANCELLED'}
 
         source_path = bpy.path.abspath(root_props.source_filepath)
@@ -374,7 +362,7 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
 
         empties = get_constraint_empties(root_obj)
         if not empties:
-            self.report({'WARNING'}, "No constraint Empties found — nothing to export.")
+            self.report({'WARNING'}, "没有找到任何约束，无内容可导出。")
             return {'CANCELLED'}
 
         # --- Build parser: re-parse source if present, else use cached stub ---
@@ -385,18 +373,27 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
                 parser = JCNSParser(source_path)
                 parser.parse()
             except Exception as exc:
-                self.report({'ERROR'}, f"Re-parse error: {exc}")
+                self.report({'ERROR'}, f"重新解析源文件失败：{exc}")
                 return {'CANCELLED'}
         else:
             if not root_props.cached_file_header:
                 self.report(
                     {'ERROR'},
-                    f"Source file not found and no cached header available: {source_path}\n"
-                    "Re-import the file to rebuild the cache."
+                    f"源文件不存在，也没有缓存的文件头：{source_path}\n"
+                    "请重新导入该文件以重建缓存。"
                 )
                 return {'CANCELLED'}
-            self.report({'WARNING'}, f"Source file missing — exporting from cached header data.")
+            self.report({'WARNING'}, "源文件缺失，将使用导入时缓存的文件头导出。")
             parser = _build_stub_parser(root_props, empties)
+
+        # --- Refuse to write a file the writer cannot faithfully reproduce ---
+        from jcns_validate import check_exportable, format_problems
+        problems = check_exportable(parser)
+        if problems:
+            msg = format_problems(problems, os.path.basename(source_path))
+            print("[JCNS EXPORT] " + msg)
+            self.report({'ERROR'}, msg.replace('\n', '  '))
+            return {'CANCELLED'}
 
         n_orig = len(parser.constraints)
         n_curr = len(empties)
@@ -430,7 +427,7 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
             writer = JCNSWriter(parser, out_path)
             writer.build_lossless(clean_hashes=self.clean_hashes)
         except Exception as exc:
-            self.report({'ERROR'}, f"Writer error: {exc}")
+            self.report({'ERROR'}, f"写入失败：{exc}")
             return {'CANCELLED'}
 
         # --- MD5 after write ---
@@ -442,13 +439,13 @@ class JCNS_OT_ExportFile(Operator, ExportHelper):
 
         basename = os.path.basename(out_path)
         if md5_before is None:
-            self.report({'INFO'}, f"Exported '{basename}' (from cached header, no source MD5).")
+            self.report({'INFO'}, f"已导出「{basename}」（基于缓存文件头，无法比对 MD5）。")
         elif md5_before == md5_after:
-            self.report({'INFO'}, f"Exported '{basename}' — no changes (MD5 identical).")
+            self.report({'INFO'}, f"已导出「{basename}」—— 内容无变化（MD5 相同）。")
         else:
             self.report(
                 {'INFO'},
-                f"Exported '{basename}' (MD5 {md5_before[:8]}… → {md5_after[:8]}…)"
+                f"已导出「{basename}」（MD5 {md5_before[:8]}… → {md5_after[:8]}…）"
             )
         return {'FINISHED'}
 

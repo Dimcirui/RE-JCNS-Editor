@@ -6,19 +6,21 @@ from bpy.props import (
     BoolProperty,
     EnumProperty,
     PointerProperty,
+    CollectionProperty,
 )
 from bpy.types import PropertyGroup
 
 bl_info = {
     "name": "RE Engine JCNS Editor",
     "author": "JCNS Reverse Engineering Project",
-    "version": (0, 3, 0),
+    "version": (0, 10, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > JCNS Editor | File > Import/Export",
     "description": (
         "Import, edit, and export RE Engine JCNS joint constraint files "
         "for Monster Hunter Wilds (v102). Each imported file creates a green "
-        "collection with one Empty per constraint."
+        "collection with one Empty per constraint, each carrying its full list "
+        "of driving sources."
     ),
     "category": "Animation",
 }
@@ -29,27 +31,31 @@ bl_info = {
 # ---------------------------------------------------------------------------
 
 AXIS_ITEMS = [
-    ('X', "X", "X axis (or quaternion X component)"),
-    ('Y', "Y", "Y axis (or quaternion Y component)"),
-    ('Z', "Z", "Z axis (or quaternion Z component)"),
-    ('W', "W", "W quaternion component (not yet supported as driver target)"),
+    ('X', "X", "骨骼局部 X 轴（或四元数 X 分量）"),
+    ('Y', "Y", "骨骼局部 Y 轴（或四元数 Y 分量）"),
+    ('Z', "Z", "骨骼局部 Z 轴（或四元数 Z 分量）"),
+    ('W', "W", "四元数 W 分量（暂不支持生成驱动器）"),
 ]
 
-INTERPOLATION_ITEMS = [
-    ('Linear',       "Linear",       "Linear interpolation"),
-    ('FastInAndOut', "FastInAndOut", "Fast In And Out (default in all observed files)"),
-    ('FastOut',      "FastOut",      "Fast Out"),
-    ('FastIn',       "FastIn",       "Fast In"),
-    ('SlowInAndOut', "SlowInAndOut", "Slow In And Out"),
-    ('SlowOut',      "SlowOut",      "Slow Out"),
-    ('SlowIn',       "SlowIn",       "Slow In"),
-]
-
-INTERPOLATION_TO_INT = {
-    'Linear': 0, 'FastInAndOut': 1, 'FastOut': 2, 'FastIn': 3,
-    'SlowInAndOut': 4, 'SlowOut': 5, 'SlowIn': 6,
-}
-INT_TO_INTERPOLATION = {v: k for k, v in INTERPOLATION_TO_INT.items()}
+# ConstraintSource_v2 bytes +24 / +25.
+#
+# These were previously exposed as an "Interpolation" dropdown based on bt v0.65.13,
+# which labelled +25 as InterpolationID (Linear / FastInAndOut / …).  Upstream bt
+# v0.65.14 renamed +24 to UpdateTimingID and +25 to TransformIDSrc, and the template
+# author marks BOTH readings "Not sure".
+#
+# Survey of 23031 constraint sources across 884 v102 files:
+#     +24 ∈ {0: 1700, 1: 3137, 2: 1879, 3: 16306, 4: 2, 5: 7}
+#     +25 ∈ {0: 1285, 1: 1455, 2: 373, 3: 19053, 4: 273, 5: 592}
+# 21 distinct (+24, +25) combinations occur; the two bytes are NOT locked together.
+#
+# Neither reading fully accounts for the data: +24 reaches 4 and 5, outside
+# UpdateTimingID (0..3), and +25 reaches 5, outside TransformIDSrc (0..4) though
+# inside the older InterpolationID (0..6).  Both are marked "Not sure" upstream.
+#
+# Because the semantics are unresolved and a wrong guess silently changes engine
+# behaviour, both are edited as raw bytes rather than named enums.
+UPDATE_TIMING_HINT = "0=MotionBegin 1=MotionEnd 2=ConstraintBegin 3=ConstraintEnd (bt 0.65.14 guess)"
 
 TRANSFORM_ITEMS = [
     ('Translation',    "Translation",    "ID=0: Translational constraint"),
@@ -145,101 +151,149 @@ def _search_target_bone(self, context, edit_text):
 
 
 # ---------------------------------------------------------------------------
+# Property Group: one ConstraintSource_v2 block
+# ---------------------------------------------------------------------------
+
+class JCNSSourceProperties(PropertyGroup):
+    """
+    One driving source of a constraint — maps 1:1 onto a 72-byte
+    ConstraintSource_v2 block in the file.
+
+    A constraint has SourceCount of these (about 12% of constraints in shipped
+    files have more than one; up to 8 have been observed).
+    """
+
+    source_bone: StringProperty(
+        name="驱动骨骼",
+        description="读取旋转的骨骼。可输入以搜索本文件哈希表中的骨骼名",
+        default="",
+        search=_search_source_bone,
+        search_options={'SUGGESTION'},
+    )
+    source_axis: EnumProperty(
+        name="源局部轴向",
+        description="读取驱动骨骼的哪个局部轴。JCNS 的映射定义在骨骼自身的局部坐标系上，不是全局坐标系",
+        items=AXIS_ITEMS,
+        default='X',
+    )
+
+    # --- Three-point piecewise mapping ---
+    from_start: FloatProperty(
+        name="From 起点", description="MapFrom 点A — 第一段起始锚点（源角度，单位度）",
+        default=0.0, precision=2, step=10,
+    )
+    from_kink: FloatProperty(
+        name="From 折点", description="MapFrom 点B — 两段斜率的分界折点（源角度，单位度）",
+        default=0.0, precision=2, step=10,
+    )
+    from_end: FloatProperty(
+        name="From 终点", description="MapFrom 点C — 第二段终止锚点，源骨骼最大偏转角（单位度）",
+        default=0.0, precision=2, step=10,
+    )
+    to_start: FloatProperty(
+        name="To 起点", description="MapTo 点A — 对应 from_start 的输出值",
+        default=0.0, precision=2, step=10,
+    )
+    to_kink: FloatProperty(
+        name="To 折点", description="MapTo 点B — 折点处的输出值（引擎读取此值）",
+        default=0.0, precision=2, step=10,
+    )
+    to_end: FloatProperty(
+        name="To 终点", description="MapTo 点C — 目标骨骼最大输出旋转量（单位度）",
+        default=0.0, precision=2, step=10,
+    )
+
+    # --- Rest-pose quaternion ---
+    rest_quat_x: FloatProperty(name="Quat X", default=0.0, precision=5)
+    rest_quat_y: FloatProperty(name="Quat Y", default=0.0, precision=5)
+    rest_quat_z: FloatProperty(name="Quat Z", default=0.0, precision=5)
+    rest_quat_w: FloatProperty(name="Quat W", default=1.0, precision=5)
+
+    # --- Raw bytes ---
+    update_timing: IntProperty(
+        name="更新时机 (+24)",
+        description=(
+            "ConstraintSource_v2 byte +24. Meaning unconfirmed — bt 0.65.14 reads it as "
+            "UpdateTimingID: " + UPDATE_TIMING_HINT + ". Observed values: 0..5"
+        ),
+        default=3, min=0, max=255,
+    )
+    src_transform_id: IntProperty(
+        name="源变换ID (+25)",
+        description=(
+            "ConstraintSource_v2 byte +25. Meaning UNCONFIRMED and disputed: bt 0.65.13 read "
+            "it as InterpolationID (0..6), bt 0.65.14 reads it as TransformIDSrc (0..4). "
+            "Observed values across 884 files are 0..5 — value 5 fits neither reading "
+            "cleanly. Change only if you know what you are doing"
+        ),
+        default=3, min=0, max=255,
+    )
+    unk_byte2: IntProperty(
+        name="未知字节 (+27)", description="ConstraintSource_v2 偏移 +27 的字节",
+        default=0, min=0, max=255,
+    )
+    complex_mapping_info_count: IntProperty(
+        name="复杂映射数", description="bt: ComplexMappingInfoCount",
+        default=0, min=0, max=65535,
+    )
+    unknown_uint16: IntProperty(
+        name="未知 UInt16", description="ConstraintSource_v2 偏移 +22",
+        default=0, min=0, max=65535,
+    )
+    unknown_uint32_2: IntProperty(
+        name="未知 UInt32 (+28)", description="ConstraintSource_v2 偏移 +28",
+        default=0, min=0,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Property Group: attached to each constraint Empty child object
 # ---------------------------------------------------------------------------
 
 class JCNSConstraintProperties(PropertyGroup):
     """
     Stored on every per-constraint child Empty inside a JCNS collection.
-    The Empty's name is kept as '[idx] SrcBone → TgtBone Axis' by the addon.
+    Maps onto one 80-byte ConstraintInfo block plus its list of sources.
     """
 
+    # Explicit marker — set at import / Add Constraint.  Previously the addon
+    # detected constraint Empties by 'source_bone is non-empty', which stopped
+    # working once sources moved into their own collection.
+    is_jcns_constraint: BoolProperty(default=False)
+
+    sources: CollectionProperty(type=JCNSSourceProperties)
+    active_source_index: IntProperty(default=0)
+
     # --- Identity ---
-    source_bone: StringProperty(
-        name="Source Bone",
-        description="Driving bone name. Type to search bones available in this file's hash list.",
-        default="",
-        search=_search_source_bone,
-        search_options={'SUGGESTION'},
-    )
     target_bone: StringProperty(
-        name="Target Bone",
-        description="Driven bone name. Type to search bones available in this file's hash list.",
+        name="目标骨骼",
+        description="被驱动的骨骼。可输入以搜索本文件哈希表中的骨骼名",
         default="",
         search=_search_target_bone,
         search_options={'SUGGESTION'},
     )
     transform_type: EnumProperty(
-        name="Transform Type",
-        description="Kind of constraint (Rotation, Location, Scale, …)",
+        name="变换类型",
+        description="约束驱动的是旋转、平移还是缩放等",
         items=TRANSFORM_ITEMS,
         default='Rotation',
     )
 
-    # --- Axes (editable — exported back to file) ---
-    source_axis: EnumProperty(
-        name="Source Axis",
-        description="Which axis of the source bone is read",
-        items=AXIS_ITEMS,
-        default='X',
-    )
+    # --- Axis (editable — exported back to file) ---
     target_axis: EnumProperty(
-        name="Target Axis",
-        description="Which axis of the target bone is driven",
+        name="目标局部轴向",
+        description="驱动目标骨骼的哪个局部轴。JCNS 的映射定义在骨骼自身的局部坐标系上，不是全局坐标系",
         items=AXIS_ITEMS,
         default='X',
     )
-
-    # --- Three-point piecewise mapping (editable — exported back to file) ---
-    # File layout: two range structs {start, kink, end} × 2, then rest-pose quaternion.
-    # Three anchor points define a two-segment piecewise linear transfer function:
-    #   Seg 1: source [from_start → from_kink]  maps output [to_start → to_kink]   slope k1
-    #   Seg 2: source [from_kink  → from_end]   maps output [to_kink  → to_end]    slope k2
-    # to_kink is always 0.0 in all observed files (kink point anchored at zero output).
-    from_start: FloatProperty(
-        name="From 起点",
-        description="MapFrom 点A — 第一段起始锚点（源角度，单位度）",
-        default=0.0, precision=2, step=10,
-    )
-    from_kink: FloatProperty(
-        name="From 折点",
-        description="MapFrom 点B — 两段斜率的分界折点（源角度，单位度）",
-        default=0.0, precision=2, step=10,
-    )
-    from_end: FloatProperty(
-        name="From 终点",
-        description="MapFrom 点C — 第二段终止锚点，源骨骼最大偏转角（单位度）",
-        default=0.0, precision=2, step=10,
-    )
-    to_start: FloatProperty(
-        name="To 起点",
-        description="MapTo 点A — 对应 from_start 的输出值（1:1 穿越型时等于 from_start）",
-        default=0.0, precision=2, step=10,
-    )
-    to_kink: FloatProperty(
-        name="To 折点",
-        description="MapTo 点B — 折点处的输出值（已验证：引擎读取此值；观测文件中恒为 0.0）",
-        default=0.0, precision=2, step=10,
-    )
-    to_end: FloatProperty(
-        name="To 终点",
-        description="MapTo 点C — 目标骨骼最大输出旋转量（单位度）",
-        default=0.0, precision=2, step=10,
-    )
-
-    # --- Rest-pose quaternion (editable — exported; always [0,0,0,1] in all observed files) ---
-    rest_quat_x: FloatProperty(name="Quat X", default=0.0, precision=5)
-    rest_quat_y: FloatProperty(name="Quat Y", default=0.0, precision=5)
-    rest_quat_z: FloatProperty(name="Quat Z", default=0.0, precision=5)
-    rest_quat_w: FloatProperty(name="Quat W", default=1.0, precision=5)
 
     # --- ConstraintInfo raw fields (editable, exported) ---
     # flags_cns: editable int + 8 bit checkboxes (bidirectional sync via update callbacks)
     cns_flags: IntProperty(
-        name="Flags", description="bt: flags_cns — 0x30 in all observed files",
+        name="标志位", description="bt: flags_cns。位4（驱动骨骼）与位5（驱动量为旋转）在导出时会按变换类型自动重算；位0 保留你的设置",
         default=0x30, min=0, max=255, update=_update_bits_from_flags,
     )
-    flags_expanded: BoolProperty(name="展开 Flags", default=False)
+    flags_expanded: BoolProperty(name="展开标志位", default=False)
     flag_bit_0: BoolProperty(name="Bit0 — isAdd?",  default=False, update=_update_flags_from_bits)
     flag_bit_1: BoolProperty(name="Bit1",            default=False, update=_update_flags_from_bits)
     flag_bit_2: BoolProperty(name="Bit2",            default=False, update=_update_flags_from_bits)
@@ -273,34 +327,6 @@ class JCNSConstraintProperties(PropertyGroup):
     parent_tail_4: IntProperty(name="Tail[4]", default=0, min=0, max=255)
     parent_tail_5: IntProperty(name="Tail[5]", default=0, min=0, max=255)
 
-    # --- ConstraintSource_v2 raw fields (editable, exported) ---
-    interpolation: EnumProperty(
-        name="Interpolation",
-        description="bt: InterpolationID — interpolation mode for the mapping curve",
-        items=INTERPOLATION_ITEMS,
-        default='FastInAndOut',
-    )
-    unk_byte0: IntProperty(
-        name="UnkByte0 (+24)", description="Source constant, always 3 in observed files",
-        default=3, min=0, max=255,
-    )
-    unk_byte2: IntProperty(
-        name="UnkByte2 (+27)", description="Source byte at offset +27, always 0",
-        default=0, min=0, max=255,
-    )
-    complex_mapping_info_count: IntProperty(
-        name="ComplexMappingInfoCount", description="bt: ComplexMappingInfoCount — usually 0",
-        default=0, min=0, max=65535,
-    )
-    unknown_uint16: IntProperty(
-        name="UnknownUInt16", description="Source uint16 at offset +22, always 0",
-        default=0, min=0, max=65535,
-    )
-    unknown_uint32_2: IntProperty(
-        name="UnknownUInt32 (+28)", description="Source uint32 at offset +28, always 0",
-        default=0, min=0,
-    )
-
     # --- Material constraint-specific fields (populated at import, editable) ---
     mat_name_hash: StringProperty(
         name="MaterialNameHash",
@@ -321,6 +347,13 @@ class JCNSConstraintProperties(PropertyGroup):
     mat_tail_1: IntProperty(name="MatTail[1]", default=0, min=0, max=255)
     mat_tail_2: IntProperty(name="MatTail[2]", default=0, min=0, max=255)
 
+    # --- JointExportGraph path (Type 5 empties only) ---
+    jxg_path: StringProperty(
+        name="路径",
+        description="JointExportGraph 路径字符串（文件中为 UTF-16LE）",
+        default="",
+    )
+
     # --- Section type (set at import, read-only in UI) ---
     constraint_type: StringProperty(
         name="Constraint Type",
@@ -330,8 +363,8 @@ class JCNSConstraintProperties(PropertyGroup):
 
     # --- Driver state (runtime, not exported) ---
     driver_applied: BoolProperty(
-        name="Driver Applied",
-        description="Whether a Blender driver is currently active for this constraint",
+        name="已应用驱动器",
+        description="此约束当前是否已生成 Blender 驱动器",
         default=False,
     )
 
@@ -350,14 +383,14 @@ class JCNSRootProperties(PropertyGroup):
     The collection contains one root Empty + N per-constraint Empties.
     """
     source_filepath: StringProperty(
-        name="Source File",
-        description="Absolute path to the original .jcns.102 file",
+        name="源文件",
+        description="原始 .jcns 文件的绝对路径",
         subtype='FILE_PATH',
         default="",
     )
     target_armature: PointerProperty(
-        name="Target Armature",
-        description="Armature whose bones receive the driven constraints",
+        name="目标骨架",
+        description="约束要作用到的骨架",
         type=bpy.types.Object,
         poll=_armature_poll,
     )
@@ -376,12 +409,30 @@ class JCNSRootProperties(PropertyGroup):
         description="Base64 of section table data from source file",
         default="",
     )
+    source_combine: EnumProperty(
+        name="多源合并",
+        description=(
+            "How several mapped outputs driving the SAME bone axis are folded into "
+            "one value. This covers both a constraint with multiple sources and "
+            "several constraints targeting the same channel. The engine's real rule "
+            "is NOT yet reverse-engineered — compare against an in-game capture "
+            "before trusting any of these"
+        ),
+        items=[
+            ('SUM',     "求和",   "把各路输出相加"),
+            ('MAX',     "取最大", "取最大的那一路输出"),
+            ('MIN',     "取最小", "取最小的那一路输出"),
+            ('AVERAGE', "平均",   "所有输出的平均值"),
+            ('FIRST',   "仅第一路", "只用第一个驱动源，忽略其余"),
+        ],
+        default='SUM',
+    )
     detected_game: EnumProperty(
-        name="Game",
+        name="游戏",
         description="Game this JCNS file belongs to (detected at import)",
         items=[
-            ('MHW_WILDS', "MH Wilds (v102)", "Monster Hunter Wilds post-TU4"),
-            ('RE9',       "RE9 / PRAGMATA (v35)", "Resident Evil 9 / PRAGMATA"),
+            ('MHW_WILDS', "怪物猎人荒野 (v102)", "Monster Hunter Wilds TU4 之后"),
+            ('RE9',       "生化危机9 / PRAGMATA (v35)", "Resident Evil 9 / PRAGMATA"),
         ],
         default='MHW_WILDS',
     )
@@ -408,7 +459,7 @@ def get_jcns_constraint(context):
     if obj is None:
         return None, None
     props = getattr(obj, 'jcns_cns_props', None)
-    if props and props.source_bone:
+    if props and props.is_jcns_constraint:
         return obj, props
     return None, None
 
@@ -469,11 +520,62 @@ def get_constraint_empties(root_empty):
     return sorted(empties, key=_sort_key)
 
 
-def make_constraint_empty_name(idx, source_bone, target_bone, target_axis, source_axis='X'):
-    """Generate the canonical display name for a constraint Empty."""
+def channel_key(cns_props):
+    """The Blender F-Curve channel a constraint drives: (bone, transform, axis).
+
+    JCNS happily stores several ConstraintInfo blocks that drive the same bone on
+    the same axis, and the engine evidently folds them together.  Blender allows
+    exactly one driver per F-Curve channel, so constraints sharing a key have to
+    be merged into a single driver — applying them one by one just means the last
+    one silently replaces all the others.
+    """
+    return (cns_props.target_bone, cns_props.transform_type, cns_props.target_axis)
+
+
+def group_constraints_by_channel(root_empty):
+    """Return {channel_key: [constraint Empty, …]} preserving constraint order."""
+    groups = {}
+    for empty in get_constraint_empties(root_empty):
+        groups.setdefault(channel_key(empty.jcns_cns_props), []).append(empty)
+    return groups
+
+
+def sibling_constraints(constraint_empty):
+    """Other constraint Empties fighting for the same channel as this one."""
+    root_obj, _ = get_jcns_root_from_constraint(constraint_empty)
+    if root_obj is None:
+        return []
+    key = channel_key(constraint_empty.jcns_cns_props)
+    return [e for e in group_constraints_by_channel(root_obj).get(key, [])
+            if e is not constraint_empty]
+
+
+def make_constraint_empty_name(idx, source_bone, target_bone, target_axis,
+                               source_axis='X', extra_sources=0):
+    """
+    Generate the canonical display name for a constraint Empty.
+
+    extra_sources > 0 appends '(+N)' so multi-source constraints are visible in
+    the Outliner without opening the panel.
+    """
     src_ax = source_axis if isinstance(source_axis, str) else INT_TO_AXIS.get(source_axis, 'X')
     tgt_ax = target_axis if isinstance(target_axis, str) else INT_TO_AXIS.get(target_axis, 'X')
-    return f"[{idx:02d}] {source_bone} {src_ax} → {target_bone or '???'} {tgt_ax}"
+    suffix = f" (+{extra_sources})" if extra_sources > 0 else ""
+    return f"[{idx:02d}] {source_bone or '???'} {src_ax}{suffix} → {target_bone or '???'} {tgt_ax}"
+
+
+def constraint_name_from_props(idx, props):
+    """Build the Empty name straight from a JCNSConstraintProperties instance."""
+    srcs = props.sources
+    first = srcs[0] if len(srcs) else None
+    return make_constraint_empty_name(
+        idx,
+        first.source_bone if first else '',
+        props.target_bone,
+        props.target_axis,
+        first.source_axis if first else 'X',
+        max(0, len(srcs) - 1),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +589,7 @@ from . import jcns_ui
 from . import jcns_drivers
 
 _classes = [
+    JCNSSourceProperties,       # must register before the group that references it
     JCNSConstraintProperties,
     JCNSRootProperties,
 ]
