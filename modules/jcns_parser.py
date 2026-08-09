@@ -70,47 +70,92 @@ class JCNSParser:
       +32:  TargetHashIndex       uint32   index into hash_list → target bone hash
       +36:  ObjectHash            uint32   direct target bone hash (redundant with above)
       +40:  PropertyHash          uint32   property hash
-      +44:  ConeDriverInfoCount   uint8    bt: ConeDriverInfoCount
+      +44:  ConeDriverInfoCount   uint8    bt: ConeDriverInfoCount — 0 in every one of the
+                                             19884 constraints surveyed; no shipped file uses
+                                             ConeDrivers at all.
       +45:  SourceCount           uint8    number of ConstraintSource_v2 blocks; ~12% of
                                              constraints have more than 1 (up to 8 observed)
-      +46:  Flags                 uint8    bt: flags_cns  — 0x30 in all observed files
+      +46:  Flags                 uint8    bt: flags_cns.  11 distinct values observed; bit4/bit5
+                                             are deterministic functions of TransformType
+                                             (bit4 "isJoint" set for types {0,1,2,4,5,6,13,14},
+                                             bit5 "isAngular" for the rotation-ish subset
+                                             {1,4,5,6,13,14}).  bit0 ("isAdd?" per bt) is the only
+                                             bit that varies independently within one
+                                             TransformType — see modules/jcns_flags.py.
+                                             bits 1/6/7 never set in any observed file.
       +47:  TransformType         uint8    bt: TransformationID  0=Translation 1=Rotation 2=Scale …
-      +48:  UnknownVector4D       vec4     [0,0,0,1] (quaternion identity at rest)
-      +64:  UnknownFloat2         float[2] [0,0] usually
-      +72:  UnknownUInt8          uint8
-      +73:  TransformAxis         uint8    bt: AxisID — target axis (may differ from src-specific)
-      +74:  UnknownUInt8 × 6
+      +48:  UnknownVector4D       vec4     [0,0,0,1] in every observed constraint
+      +64:  UnknownFloat2         float[2] [0,0] in 99.6%; the rest look like angle limits
+                                             (e.g. [-45,0], [-90,-90], [-20,-20])
+      +72:  UnknownUInt8          uint8    0 in 98.5%; also seen {1,2,3,4}
+      +73:  TransformAxis         uint8    bt: AxisID — target axis (may differ from src-specific).
+                                             Unlike source_axis, this DOES take W (1.3%).
+      +74:  UnknownUInt8 × 6      Not six free bytes: +76/+78/+79 are always 0 and +74 is 0 in
+                                             98.8%, but +75 and +77 are two live enum-ish fields.
+                                             +75 ∈ {0,1,2,3,4,5,8} (2 dominates at 70%),
+                                             +77 ∈ {0,1,2,3,4} (0 dominates at 74%).
+                                             Meaning unknown; preserved verbatim on write.
 
     72-byte ConstraintSource_v2 layout (pointed to by OffsetSourceList):
       +0:   ComplexMappingInfoOffset  uint64   bt: ComplexMappingInfoOffset (0=none)
       +8:   SourceNameOffset          uint64   pointer to SOURCE bone name (UTF-16LE)
       +16:  SourceHashIndex           uint32   index into hash_list → source bone hash
-      +20:  ComplexMappingInfoCount   uint16   bt: ComplexMappingInfoCount (0 in all observed)
-      +22:  UnknownUInt16             uint16   = 0 in all observed files
-      +24:  UpdateTiming              uint8    bt(0.65.14): UpdateTimingID.  Observed {0,1,2,3},
-                                              matching MotionBegin/MotionEnd/ConstraintBegin/ConstraintEnd.
+      +20:  ComplexMappingInfoCount   uint16   bt: ComplexMappingInfoCount.  Nonzero in 78 of
+                                              23031 sources, taking values {3, 4, 7}.
+      +22:  UnknownUInt16             uint16   0 in all but a single observed source (which has 1).
+      +24:  UpdateTiming              uint8    bt(0.65.14): UpdateTimingID.  All six enum values
+                                              occur: MotionBegin(7.4%) MotionEnd(13.6%)
+                                              ConstraintBegin(8.2%) ConstraintEnd(70.8%)
+                                              Last(2 sources) ByBehavior(7 sources).
+                                              Appears to encode evaluation order — sources that are
+                                              themselves constraint outputs tend to read at
+                                              ConstraintEnd, raw animated bones earlier — rather
+                                              than anything about how sources combine.
       +25:  SrcTransformID            uint8    MEANING UNCERTAIN — bt 0.65.13 called this
                                               InterpolationID, bt 0.65.14 renamed it to
                                               TransformIDSrc; the template author marks both
-                                              "Not sure".  Observed values are only {1, 3}, and
-                                              +25==3 occurs iff +24==3.  Treated as a raw byte.
-      +26:  source_axis               uint8    bt: SourceAxis  0=X 1=Y 2=Z 3=W
-      +27:  UnkByte2                  uint8    = 0 in all observed files
-      +28:  UnknownUInt32_2      uint32   = 0
+                                              "Not sure".  Observed {0,1,2,3,4,5}: mostly
+                                              Src_Rotation_3 (82.7%), but value 5 is beyond the
+                                              bt enum's last defined entry.  Among real bone
+                                              rotation targets, the 70 sources tagged
+                                              Src_Translation(0) carry From ranges shaped like the
+                                              rotation ones (91% land on multiples of 5, same
+                                              magnitude band), so the tag alone does not establish
+                                              a distance-driven mechanism.  Treated as a raw byte.
+      +26:  source_axis               uint8    bt: SourceAxis  0=X 1=Y 2=Z 3=W.  Only {X,Y,Z} ever
+                                              observed here — sources never use W, though targets do.
+      +27:  UnkByte2                  uint8    NOT constant: {0:79.3%, 1:14.8%, 2:5.6%, 3:0.3%}.
+      +28:  UnknownUInt32_2      uint32   Really two live bytes; +30/+31 are always 0.
+                                              +28 ∈ {0,1,2,3} (0 in 91.5%).
+                                              +29 == 1 iff ComplexMappingInfoCount > 0 (exact
+                                              match across all 78 cases), so it reads as that
+                                              feature's enable flag; +29 == 2 occurs in 39 further
+                                              sources with no complex mapping and is unexplained.
       +32:  from_start           float    Point A source angle (rest-side boundary)
       +36:  from_kink            float    Point B source angle (kink/折点 — slope changes here)
       +40:  from_end             float    Point C source angle (終点 — end of second segment)
       +44:  to_start             float    Point A output (= 0 for one-sided, = extreme for through-range like Back X)
-      +48:  to_kink              float    Point B output — engine reads this; 0.0 in all observed files
+      +48:  to_kink              float    Point B output — engine reads this.  NOT a dead field:
+                                        nonzero in 14.8% of sources across 98 distinct values,
+                                        so the mapping's middle anchor is genuinely used.
       +52:  to_end               float    Point C output (= actual maximum target output)
-      +56:  rest_quat_x          float    Rest-pose quaternion X — always 0.0
-      +60:  rest_quat_y          float    Rest-pose quaternion Y — always 0.0
-      +64:  rest_quat_z          float    Rest-pose quaternion Z — always 0.0
-      +68:  rest_quat_w          float    Rest-pose quaternion W — always 1.0
+      +56:  rest_quat_x          float    Rest-pose quaternion X — 0.0 in every observed source
+      +60:  rest_quat_y          float    Rest-pose quaternion Y — 0.0 except 2 sources (-0.7071)
+      +64:  rest_quat_z          float    Rest-pose quaternion Z — 0.0 in every observed source
+      +68:  rest_quat_w          float    Rest-pose quaternion W — 1.0 except the same 2 sources
+                                        (0.7071); together those two encode a 90° rotation about Y
+                                        rather than identity, so this is a real rest pose, not padding.
     Total: 72 bytes
+
+    Field-frequency claims above were measured over the 884 shipped .jcns.102 files in
+    E:\\Desktop\\natives\\JCNS-natives (19884 constraints / 23031 sources) by
+    REE-JCNS-Research/scripts/corpus_stats.  Every non-constant field listed here is
+    round-tripped verbatim by jcns_writer; the defaults it falls back to apply only to
+    newly created constraints.
 
     JCNS axis convention (AxisID):
       0=X  1=Y  2=Z  3=W (quaternion component)
+      bt 0.65.14 also defines UnknownAxis_4..8, none of which occur in the corpus.
 
     Mapping formula (correct 2-anchor interpretation):
       output = clamp(
@@ -124,12 +169,11 @@ class JCNSParser:
     """
 
     AXIS_NAMES = ['X', 'Y', 'Z', 'W']
-    TRANSFORM_NAMES = {
-        0: 'Translation', 1: 'Rotation', 2: 'Scale', 3: 'BlendShape',
-        4: 'UnkCtrl_4', 5: 'UnkTopBank_5', 7: 'Material_Color',
-        8: 'Material_4D', 9: 'Material_3D', 10: 'Material_2D',
-        11: 'Scalar',
-    }
+    # No transform-type name table here on purpose: TRANSFORM_TYPE_MAP in __init__.py
+    # is the single source of truth, and it covers all of bt 0.65.14's IDs 0-16.  A
+    # second copy living down here went stale without anyone noticing (it stopped at
+    # 11, missing Unknown_6 and UnkRotation_13/14 — between them 19% of every
+    # constraint in the shipped corpus).
 
     def __init__(self, filepath):
         self.filepath = filepath
