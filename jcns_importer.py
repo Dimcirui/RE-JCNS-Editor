@@ -81,8 +81,7 @@ def _strip_ext(filename):
 def do_import(filepath, context, armature_obj=None):
     """
     Parse the JCNS file and build the collection hierarchy.
-    Returns (root_empty, count, error_str, warnings).  error_str is '' on success;
-    warnings is a list of strings describing structures that cannot be exported.
+    Returns (root_empty, count, error_str).  error_str is '' on success.
     """
     from . import (
         AXIS_TO_INT, INT_TO_AXIS, TRANSFORM_TYPE_MAP,
@@ -95,14 +94,20 @@ def do_import(filepath, context, armature_obj=None):
         parser = JCNSParser(filepath)
         constraints = parser.parse()
     except Exception as exc:
-        return None, 0, f"解析失败：{exc}", []
+        return None, 0, f"解析失败：{exc}"
 
-    # Surface unsupported structures now, rather than after the user has edited
-    # the file and discovered at export time that it cannot be written back.
+    # This is an editor, not just a viewer: a structure the writer can never
+    # reproduce (checked on a fresh parse, so the source file is definitely
+    # available — this is not the cached-header stub) makes the whole file
+    # un-exportable, and there is no point opening something you can only
+    # look at and never save back. Refuse the import outright rather than
+    # letting the user edit for a while before finding out at export time.
     from jcns_validate import check_exportable
-    warnings = check_exportable(parser)
-    for w in warnings:
-        print(f"[JCNS IMPORT] WARNING: {w}")
+    problems = check_exportable(parser)
+    if problems:
+        msg = ("无法导入 —— 这个文件含有写入器无法完整还原的结构，编辑了也没法导出：\n"
+               + "\n".join(f"  * {p}" for p in problems))
+        return None, 0, msg
 
     # Build hash → bone-name dict if an armature was supplied
     hash_dict = _build_hash_dict(armature_obj) if armature_obj else {}
@@ -301,7 +306,7 @@ def do_import(filepath, context, armature_obj=None):
                 all_bone_names.add(src)
     root.jcns_root_props.available_bones_json = json.dumps(sorted(all_bone_names))
 
-    return root, len(constraints), '', warnings
+    return root, len(constraints), ''
 
 
 # ---------------------------------------------------------------------------
@@ -351,25 +356,21 @@ class JCNS_OT_ImportFile(Operator, ImportHelper):
         if self.resolve_hashes and self.target_armature_name != "NONE":
             armature_obj = context.scene.objects.get(self.target_armature_name)
 
-        root, count, err, warnings = do_import(filepath, context, armature_obj)
+        root, count, err = do_import(filepath, context, armature_obj)
         if err:
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
 
         arm_label = armature_obj.name if armature_obj else "无"
         summary = f"已导入 {count} 条约束 → 「{root.name}」（骨架：{arm_label}）"
-        if warnings:
-            self.report(
-                {'WARNING'},
-                f"{summary} —— 发现 {len(warnings)} 处不支持的结构，此文件无法导出，"
-                "详见系统控制台。"
-            )
-        else:
-            self.report({'INFO'}, summary)
-        # Select the root Empty
+        self.report({'INFO'}, summary)
+        # Select the root Empty, and make its collection the new working
+        # collection so export is reachable without having to keep it selected.
         bpy.ops.object.select_all(action='DESELECT')
         root.select_set(True)
         context.view_layer.objects.active = root
+        if root.users_collection:
+            context.scene.jcns_active_collection = root.users_collection[0]
         return {'FINISHED'}
 
     def invoke(self, context, event):

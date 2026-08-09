@@ -5,7 +5,7 @@ jcns_ui.py
 
 面板按「你多久看一次」分层：
 
-  JCNS_PT_Status                始终显示 —— 当前选中了什么
+  JCNS_PT_Status                始终显示 —— 工作集合 + 导出，当前选中了什么
   JCNS_PT_Root                  根节点 —— 文件、骨架、驱动器按钮、导出
     JCNS_PT_RootChannels        按驱动的骨骼通道分组列出约束
   JCNS_PT_Constraint            约束 —— 目标、驱动源、映射、诊断
@@ -73,6 +73,25 @@ def _curve_icon(sources):
     return prev.icon_id
 
 
+def _swatch_icon(index):
+    """icon_id for a flat colour square, one per palette slot.
+
+    Palette colours are fixed, so these are built once and reused — unlike
+    the curve preview they never need to be redrawn.
+    """
+    if _preview_coll is None:
+        return None
+    c = _curve()
+    slot = index % len(c.PALETTE)
+    name = "swatch%d" % slot
+    prev = _preview_coll.get(name)
+    if prev is None:
+        prev = _preview_coll.new(name)
+        prev.image_size = (8, 8)
+        prev.image_pixels_float = c.swatch(c.PALETTE[slot], 8, 8)
+    return prev.icon_id
+
+
 def _classify(context):
     """返回 'ROOT'、'CONSTRAINT' 或 None。"""
     from . import get_jcns_root, get_jcns_constraint
@@ -96,6 +115,36 @@ def _fmt(v):
     return ("%+.0f" % v) if abs(v - round(v)) < 0.005 else ("%+.2f" % v)
 
 
+def _field_row(layout, label, data, prop, icon='NONE', **kwargs):
+    """一行「标签 | 取值」，标签和输入框固定按比例分栏对齐。
+
+    面板里凡是"一个字段配一个说得清楚的标签"就走这个函数，保证不管在哪个面板，
+    骨骼名、轴向、变换类型这类主字段的排版看起来都是同一套东西。真正紧凑的
+    向量/四元数分量、字节尾巴这种"一组数字共享一个概念"的字段不走这里——
+    那些短标签直接写在 prop(text=...) 里更省地方，见 _draw_raw_group()。
+    """
+    row = layout.row(align=True)
+    split = row.split(factor=0.4)
+    split.label(text=label, icon=icon)
+    split.prop(data, prop, text="", **kwargs)
+    return row
+
+
+def _draw_raw_group(layout, title, icon, rows):
+    """一组"共享一个概念"的紧凑数值（向量、字节尾巴……），各自一个小 box。
+
+    `rows` 是若干 (data, [(prop, short_label), ...]) 对，每一对占一行。
+    """
+    box = layout.box()
+    box.label(text=title, icon=icon)
+    col = box.column(align=True)
+    for data, props in rows:
+        r = col.row(align=True)
+        for prop, short_label in props:
+            r.prop(data, prop, text=short_label)
+    return box
+
+
 # ---------------------------------------------------------------------------
 # 驱动源列表
 # ---------------------------------------------------------------------------
@@ -107,6 +156,9 @@ class JCNS_UL_Sources(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_prop, index):
         info = _mapping().describe(item)
         row = layout.row(align=True)
+        swatch = _swatch_icon(index)
+        if swatch is not None:
+            row.label(text="", icon_value=swatch)
         row.label(text=str(index), icon='DRIVER')
         row.prop(item, "source_bone", text="", emboss=False)
         row.label(text=item.source_axis)
@@ -119,7 +171,7 @@ class JCNS_UL_Sources(bpy.types.UIList):
 # ---------------------------------------------------------------------------
 
 class JCNS_PT_Status(Panel):
-    bl_label    = "RE Engine JCNS 编辑器"
+    bl_label    = "MHWs JCNS"
     bl_idname   = "JCNS_PT_status"
     bl_space_type  = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -127,16 +179,30 @@ class JCNS_PT_Status(Panel):
     bl_order       = 0
 
     def draw(self, context):
+        from . import get_export_root
         layout = self.layout
+
+        # --- 常驻操作：不管选中了什么都在，导入/导出不用先找根节点 ---
+        row = layout.row(align=True)
+        row.operator("jcns.import_file", text="导入 JCNS", icon='IMPORT')
+        row.operator("jcns.export_file", text="导出 JCNS", icon='EXPORT')
+
+        _field_row(layout, "工作集合：", context.scene, "jcns_active_collection",
+                  icon='OUTLINER_COLLECTION')
+
+        root, rp = get_export_root(context)
+        if root is not None:
+            _field_row(layout, "骨架：", rp, "target_armature", icon='ARMATURE_DATA')
+
+        layout.separator()
+
         kind = _classify(context)
 
         if kind is None:
             col = layout.column(align=True)
             col.label(text="未选中 JCNS 对象", icon='INFO')
-            col.label(text="先导入 .jcns 文件（.102 / .35），")
+            col.label(text="先导入 .jcns 文件，")
             col.label(text="再选中生成的空物体。")
-            layout.separator()
-            layout.operator("jcns.import_file", text="导入 JCNS…", icon='IMPORT')
             return
 
         if kind == 'ROOT':
@@ -176,30 +242,18 @@ class JCNS_PT_Root(Panel):
         obj, rp = get_jcns_root(context)
 
         box = layout.box()
+        box.label(text=rp.source_filepath.replace('\\', '/').split('/')[-1], icon='FILE')
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="驱动器", icon='DRIVER')
         col = box.column(align=True)
-        col.label(text="源文件：", icon='FILE')
-        col.label(text=rp.source_filepath.replace('\\', '/').split('/')[-1])
-        _GAME = {'MHW_WILDS': "怪物猎人荒野 (v102)", 'RE9': "生化危机9 / PRAGMATA (v35)"}
-        col.label(text="游戏：%s" % _GAME.get(rp.detected_game, rp.detected_game),
-                  icon='WORLD')
-
-        layout.separator()
-        layout.label(text="目标骨架：", icon='ARMATURE_DATA')
-        layout.prop(rp, "target_armature", text="")
-
-        layout.separator()
-        row = layout.row(align=True)
-        row.prop(rp, "source_combine", text="多源合并")
-        layout.label(text="合并方式尚未实机验证", icon='INFO')
-
-        col = layout.column(align=True)
         col.scale_y = 1.4
         col.operator("jcns.apply_all_drivers", text="应用全部驱动器", icon='DRIVER')
         col.operator("jcns.clear_drivers",     text="清除全部驱动器", icon='X')
 
         layout.separator()
         layout.operator("jcns.add_constraint", text="新增约束", icon='ADD')
-        layout.operator("jcns.export_file", text="导出 JCNS", icon='EXPORT')
 
 
 class JCNS_PT_RootChannels(Panel):
@@ -214,6 +268,7 @@ class JCNS_PT_RootChannels(Panel):
     bl_region_type = 'UI'
     bl_category    = 'JCNS 编辑器'
     bl_parent_id   = "JCNS_PT_root"
+    bl_options     = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         from . import get_jcns_root, group_constraints_by_channel
@@ -242,8 +297,9 @@ class JCNS_PT_RootChannels(Panel):
 
             for transform, axis, members in sorted(by_bone[bone],
                                                    key=lambda x: (x[0], x[1])):
-                sources = [sp for e in members for sp in e.jcns_cns_props.sources]
-                info = m.describe_channel(sources, rp.source_combine)
+                # Only the last constraint on the channel actually drives it.
+                sources = list(members[-1].jcns_cns_props.sources)
+                info = m.describe_channel(sources)
 
                 row = col.row(align=True)
                 row.alert = info['offset_at_rest']
@@ -304,21 +360,14 @@ class JCNS_PT_Constraint(Panel):
 
         if ctype == 'Material':
             box = layout.box()
-            col = box.column(align=True)
-            col.label(text="关联骨骼", icon='BONE_DATA')
-            row = col.row(align=True)
-            row.label(text="骨骼：")
-            row.prop(p, "target_bone", text="")
-            col.separator()
-            col.label(text="原始字段", icon='PREFERENCES')
-            row2 = col.row(align=True)
-            row2.prop(p, "mat_name_hash",     text="材质名哈希")
-            row2.prop(p, "mat_property_hash", text="属性哈希")
-            row3 = col.row(align=True)
-            row3.prop(p, "mat_transform_type_raw", text="变换ID")
-            row3.prop(p, "mat_tail_0", text="尾0")
-            row3.prop(p, "mat_tail_1", text="尾1")
-            row3.prop(p, "mat_tail_2", text="尾2")
+            box.label(text="关联骨骼", icon='BONE_DATA')
+            _field_row(box.column(align=True), "骨骼：", p, "target_bone")
+
+            _draw_raw_group(layout, "原始字段", 'PREFERENCES', [
+                (p, [("mat_name_hash", "材质名哈希"), ("mat_property_hash", "属性哈希")]),
+                (p, [("mat_transform_type_raw", "变换ID"), ("mat_tail_0", "尾0"),
+                     ("mat_tail_1", "尾1"), ("mat_tail_2", "尾2")]),
+            ])
             return
 
         if ctype != 'Ranges':
@@ -330,23 +379,40 @@ class JCNS_PT_Constraint(Panel):
             layout.label(text="导出时会原样保留。")
             return
 
+        # --- 文件内顺序 ---
+        # 顺序不是装饰：导出时按 [N] 前缀排列，同一根骨骼同一轴上有多条时后写的
+        # 那条会盖掉前面的，所以"往下挪"就是让这条说了算。
+        from . import get_jcns_root_from_constraint, get_constraint_empties
+        root_obj, _ = get_jcns_root_from_constraint(obj)
+        ordered = get_constraint_empties(root_obj) if root_obj else []
+        if obj in ordered:
+            pos = ordered.index(obj)
+            row = layout.row(align=True)
+            row.label(text="文件顺序：%d / %d" % (pos + 1, len(ordered)), icon='SORTSIZE')
+            sub = row.row(align=True)
+            sub.enabled = pos > 0
+            sub.operator("jcns.move_constraint", text="", icon='TRIA_UP').direction = 'UP'
+            sub = row.row(align=True)
+            sub.enabled = pos < len(ordered) - 1
+            sub.operator("jcns.move_constraint", text="", icon='TRIA_DOWN').direction = 'DOWN'
+
         # --- 目标 ---
+        layout.separator()
         box = layout.box()
+        box.label(text="目标", icon='OUTLINER_OB_ARMATURE')
         col = box.column(align=True)
-        col.label(text="目标", icon='OUTLINER_OB_ARMATURE')
-        r = col.row()
-        r.label(text="骨骼：")
-        r.prop(p, "target_bone", text="")
-        r = col.row()
-        r.label(text="局部轴向：")
-        r.prop(p, "target_axis", text="")
-        r = col.row()
-        r.label(text="变换：")
-        r.prop(p, "transform_type", text="")
+        _field_row(col, "骨骼：", p, "target_bone")
+        _field_row(col, "局部轴向：", p, "target_axis")
+        _field_row(col, "变换：", p, "transform_type")
 
         # --- 通道共用提示 ---
         sibs = sibling_constraints(obj)
         if sibs:
+            # Order decides everything here, so say who wins rather than just
+            # listing the neighbours.
+            channel_members = [e for e in ordered
+                               if e is obj or e in sibs] if ordered else [obj]
+            is_winner = bool(channel_members) and channel_members[-1] is obj
             sbox = layout.box()
             scol = sbox.column(align=True)
             scol.label(text="另有 %d 条约束也在驱动 %s 的局部 %s 轴"
@@ -354,7 +420,14 @@ class JCNS_PT_Constraint(Panel):
                        icon='INFO')
             for s in sibs:
                 scol.label(text="    " + s.name, icon='DOT')
-            scol.label(text="它们会合并成同一条驱动器。")
+            if is_winner:
+                scol.label(text="本条在最后，实际生效的是它。", icon='CHECKMARK')
+            else:
+                row = scol.row()
+                row.alert = True
+                row.label(text="本条会被靠后的那条整条覆盖，不产生任何效果。",
+                          icon='ERROR')
+                scol.label(text="想让它生效，用上面的顺序按钮把它移到最后。")
 
         # --- 驱动源 ---
         layout.separator()
@@ -404,12 +477,8 @@ class JCNS_PT_Constraint(Panel):
         col = layout.column(align=True)
         if label:
             col.label(text=label, icon='BONE_DATA')
-        r = col.row()
-        r.label(text="骨骼：")
-        r.prop(sp, "source_bone", text="")
-        r = col.row()
-        r.label(text="局部轴向：")
-        r.prop(sp, "source_axis", text="")
+        _field_row(col, "骨骼：", sp, "source_bone")
+        _field_row(col, "局部轴向：", sp, "source_axis")
 
         self._draw_plain(layout, p, sp, m)
         self._draw_curve(layout, p, sp)
@@ -491,7 +560,7 @@ class JCNS_PT_Constraint(Panel):
                          text="对调输出首尾（可修正）", icon='ARROW_LEFTRIGHT')
 
     def _draw_curve(self, layout, p, sp):
-        """画出折线。多源约束会把同通道的曲线叠在一起画。"""
+        """画出折线。多源约束会把同通道的曲线叠在一起画，每个驱动源一种颜色。"""
         sources = list(p.sources) if len(p.sources) > 1 else [sp]
         icon = _curve_icon(sources)
         if icon is None:
@@ -501,6 +570,16 @@ class JCNS_PT_Constraint(Panel):
         row = box.row()
         row.alignment = 'CENTER'
         row.template_icon(icon_value=icon, scale=7.0)
+
+        if len(sources) > 1:
+            legend = box.column(align=True)
+            for i, s in enumerate(sources):
+                swatch = _swatch_icon(i)
+                r = legend.row(align=True)
+                if swatch is not None:
+                    r.label(text="", icon_value=swatch)
+                r.label(text="%d  %s 局部 %s 轴"
+                             % (i, s.source_bone or "?", s.source_axis))
 
 
 class JCNS_PT_ConstraintAdvanced(Panel):
@@ -526,26 +605,17 @@ class JCNS_PT_ConstraintAdvanced(Panel):
         sp = _active_source(p)
 
         if sp is not None:
-            box = layout.box()
-            col = box.column(align=True)
-            col.label(text="驱动源：静止四元数", icon='ORIENTATION_GIMBAL')
-            r = col.row(align=True)
-            r.prop(sp, "rest_quat_x", text="X")
-            r.prop(sp, "rest_quat_y", text="Y")
-            r.prop(sp, "rest_quat_z", text="Z")
-            r.prop(sp, "rest_quat_w", text="W")
-
-            col.separator()
-            col.label(text="驱动源：原始字节", icon='PREFERENCES')
-            r = col.row(align=True)
-            r.prop(sp, "update_timing",    text="+24")
-            r.prop(sp, "src_transform_id", text="+25")
-            r.prop(sp, "unk_byte2",        text="+27")
-            col.label(text="+24 / +25 含义未确认，建议不要改动", icon='INFO')
-            r = col.row(align=True)
-            r.prop(sp, "unknown_uint16",   text="U16(+22)")
-            r.prop(sp, "unknown_uint32_2", text="U32(+28)")
-            r.prop(sp, "complex_mapping_info_count", text="复杂映射数")
+            _draw_raw_group(layout, "驱动源：静止四元数", 'ORIENTATION_GIMBAL', [
+                (sp, [("rest_quat_x", "X"), ("rest_quat_y", "Y"),
+                     ("rest_quat_z", "Z"), ("rest_quat_w", "W")]),
+            ])
+            box = _draw_raw_group(layout, "驱动源：原始字节", 'PREFERENCES', [
+                (sp, [("update_timing", "+24"), ("src_transform_id", "+25"),
+                     ("unk_byte2", "+27")]),
+                (sp, [("unknown_uint16", "U16(+22)"), ("unknown_uint32_2", "U32(+28)"),
+                     ("complex_mapping_info_count", "复杂映射数")]),
+            ])
+            box.label(text="+24 / +25 含义未确认，建议不要改动", icon='INFO')
 
         box = layout.box()
         box.label(text="ConstraintInfo 原始字段", icon='PREFERENCES')
@@ -571,23 +641,19 @@ class JCNS_PT_ConstraintAdvanced(Panel):
                 rb.prop(p, attr, text="")
                 rb.label(text=desc)
 
-        col.label(text="未知四维向量：")
-        r = col.row(align=True)
-        for a in ("parent_vec4_x", "parent_vec4_y", "parent_vec4_z", "parent_vec4_w"):
-            r.prop(p, a, text=a[-1].upper())
-        col.label(text="未知浮点对：")
-        r = col.row(align=True)
-        r.prop(p, "parent_float2_x", text="X")
-        r.prop(p, "parent_float2_y", text="Y")
-        r = col.row(align=True)
-        r.prop(p, "parent_uint8_72", text="+72")
-        r.prop(p, "property_hash",   text="属性哈希")
-        r.prop(p, "cone_driver_info_count", text="锥形驱动数")
-        col.label(text="尾部字节 [74..79]：")
-        r = col.row(align=True)
-        for a in ("parent_tail_0", "parent_tail_1", "parent_tail_2",
-                  "parent_tail_3", "parent_tail_4", "parent_tail_5"):
-            r.prop(p, a, text="")
+        _draw_raw_group(layout, "未知四维向量 [48..63]", 'PREFERENCES', [
+            (p, [(a, a[-1].upper()) for a in
+                 ("parent_vec4_x", "parent_vec4_y", "parent_vec4_z", "parent_vec4_w")]),
+        ])
+        _draw_raw_group(layout, "杂项标量 [64..72]", 'PREFERENCES', [
+            (p, [("parent_float2_x", "X"), ("parent_float2_y", "Y")]),
+            (p, [("parent_uint8_72", "+72"), ("property_hash", "属性哈希"),
+                 ("cone_driver_info_count", "锥形驱动数")]),
+        ])
+        _draw_raw_group(layout, "尾部字节 [74..79]", 'PREFERENCES', [
+            (p, [(a, "") for a in ("parent_tail_0", "parent_tail_1", "parent_tail_2",
+                                   "parent_tail_3", "parent_tail_4", "parent_tail_5")]),
+        ])
 
 
 # ---------------------------------------------------------------------------

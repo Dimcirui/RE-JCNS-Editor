@@ -11,7 +11,7 @@ Two archive layouts are produced:
       what `blender --command extension build` emits.  Installed this way the
       add-on can be updated and re-enabled without restarting Blender.
 
-          RE-JCNS-Editor-extension-v0.4.1.zip
+          Wilds-JCNS-Editor-extension-v0.13.0.zip
           ├── blender_manifest.toml
           ├── __init__.py
           ├── jcns_*.py
@@ -22,8 +22,8 @@ Two archive layouts are produced:
       Everything lives inside one top-level folder and bl_info is used instead of
       the manifest.
 
-          RE-JCNS-Editor-v0.4.1.zip
-          └── RE-JCNS-Editor/
+          Wilds-JCNS-Editor-v0.13.0.zip
+          └── Wilds-JCNS-Editor/
               ├── __init__.py
               └── …
 
@@ -44,7 +44,7 @@ import sys
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ADDON_FOLDER_NAME = "RE-JCNS-Editor"
+ADDON_FOLDER_NAME = "Wilds-JCNS-Editor"
 MANIFEST = "blender_manifest.toml"
 
 # Files/dirs that ship to users.  Anything not listed here is excluded, so new

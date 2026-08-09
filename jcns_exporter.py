@@ -32,22 +32,9 @@ def _ensure_modules_path():
 
 
 def _get_active_root(context):
-    """
-    Return (root_empty, root_props) for the currently active JCNS session.
-    Accepts either the root Empty or any constraint Empty as the active object.
-    """
-    from . import (get_jcns_root, get_jcns_constraint,
-                   get_jcns_root_from_constraint)
-
-    obj, rp = get_jcns_root(context)
-    if obj is not None:
-        return obj, rp
-
-    cns_obj, _ = get_jcns_constraint(context)
-    if cns_obj:
-        return get_jcns_root_from_constraint(cns_obj)
-
-    return None, None
+    """(root_empty, root_props) to export — see __init__.get_export_root()."""
+    from . import get_export_root
+    return get_export_root(context)
 
 
 def _build_stub_parser(root_props, empties):
@@ -88,6 +75,24 @@ def _build_stub_parser(root_props, empties):
     if orig_sec_off > 0:
         stub[orig_sec_off : orig_sec_off + len(sec_data)] = sec_data
 
+    # Decode just the counts region of the cached header (Version + the
+    # version-specific counts_fields table) so check_exportable() can still see
+    # e.g. SkinConstraintCount/AimConstraintCount even without the source file.
+    # The DataEntry pointer chase that the real parser does isn't needed here —
+    # only skip it, don't guess at it.
+    from jcns_parser import LAYOUTS
+    header = {}
+    try:
+        version = struct.unpack_from('<I', tags, 0)[0]
+        layout = LAYOUTS.get(version)
+        if layout is not None:
+            header['Version'] = version
+            cb = layout['counts_base']
+            for field, (off, fmt) in layout['counts_fields'].items():
+                header[field] = struct.unpack_from(fmt, tags, cb + off)[0]
+    except struct.error:
+        header = {}   # cached header shorter than expected — leave counts unknown
+
     class _StubParser:
         pass
 
@@ -96,6 +101,8 @@ def _build_stub_parser(root_props, empties):
     parser.hash_list = hash_list
     parser.original_bytes = bytes(stub)
     parser.filepath = root_props.source_filepath
+    parser.header = header
+    parser.is_stub = True
     # Non-Range sections are not cached — they will be absent from stub exports
     parser.aim_constraints    = []
     parser.rot_expressions    = []
@@ -107,9 +114,16 @@ def _build_stub_parser(root_props, empties):
 
 def _sync_non_range_to_parser(root_obj, parser):
     """
-    Walk root_obj's children for JXG and Material empties and write
-    their current property values back into the parser object so the
-    writer picks up any edits the user made.
+    Rebuild parser.material_cns / parser.joint_export_graph entirely from the
+    cached properties on the Material / JointExportGraph child Empties.
+
+    Blender's copy is authoritative: unlike RotExpression/Aim (which have no
+    editable backing store and can only be reproduced by re-parsing the source
+    file), every field the writer needs for Material and JXG already round-trips
+    through jcns_cns_props. Rebuilding from scratch — rather than patching a
+    pre-existing parser.material_cns entry by index — means this also works when
+    exporting from the cached-header stub (no source file), and means deleting a
+    Material/JXG Empty in Blender removes it from the export too.
     """
     import struct
 
@@ -128,52 +142,52 @@ def _sync_non_range_to_parser(root_obj, parser):
         hash_list.append(h)
         return idx
 
-    for obj in root_obj.children:
-        p = getattr(obj, 'jcns_cns_props', None)
-        if p is None:
-            continue
-        ctype = p.constraint_type
-
-        if ctype == 'JointExportGraph':
-            if parser.joint_export_graph is not None:
-                parser.joint_export_graph['path'] = p.jxg_path
-
-        elif ctype == 'Material':
-            # Extract index from name "[MatNN] …"
-            name = obj.name
-            mat_idx = -1
-            if name.startswith('[Mat') and ']' in name:
-                try:
-                    mat_idx = int(name[4:name.index(']')])
-                except ValueError:
-                    pass
-            mat_list = getattr(parser, 'material_cns', [])
-            if not (0 <= mat_idx < len(mat_list)):
-                continue
-            mc = mat_list[mat_idx]
-
-            # Update joint hash index if bone name changed
-            bone_name = p.target_bone.strip()
-            if bone_name:
-                new_idx = _ensure_hash(bone_name, parser.hash_list)
-                mc['JointHashIndex'] = new_idx
-                mc['JointHash'] = parser.hash_list[new_idx]
-
-            # Rebuild raw_body (12 bytes) from editable props
-            raw = bytearray(12)
+    def _mat_index(obj):
+        name = obj.name
+        if name.startswith('[Mat') and ']' in name:
             try:
-                struct.pack_into('<I', raw, 0, int(p.mat_name_hash,     16) & 0xFFFFFFFF)
-            except (ValueError, TypeError):
+                return int(name[4:name.index(']')])
+            except ValueError:
                 pass
-            try:
-                struct.pack_into('<I', raw, 4, int(p.mat_property_hash, 16) & 0xFFFFFFFF)
-            except (ValueError, TypeError):
-                pass
-            raw[8]  = p.mat_transform_type_raw & 0xFF
-            raw[9]  = p.mat_tail_0 & 0xFF
-            raw[10] = p.mat_tail_1 & 0xFF
-            raw[11] = p.mat_tail_2 & 0xFF
-            mc['raw_body'] = bytes(raw)
+        return 9999
+
+    mat_empties = sorted(
+        (o for o in root_obj.children
+         if getattr(o, 'jcns_cns_props', None)
+         and o.jcns_cns_props.constraint_type == 'Material'),
+        key=_mat_index)
+
+    mat_entries = []
+    for obj in mat_empties:
+        p = obj.jcns_cns_props
+        bone_name = p.target_bone.strip()
+        joint_idx = _ensure_hash(bone_name, parser.hash_list) if bone_name else 0
+
+        raw = bytearray(12)
+        try:
+            struct.pack_into('<I', raw, 0, int(p.mat_name_hash,     16) & 0xFFFFFFFF)
+        except (ValueError, TypeError):
+            pass
+        try:
+            struct.pack_into('<I', raw, 4, int(p.mat_property_hash, 16) & 0xFFFFFFFF)
+        except (ValueError, TypeError):
+            pass
+        raw[8]  = p.mat_transform_type_raw & 0xFF
+        raw[9]  = p.mat_tail_0 & 0xFF
+        raw[10] = p.mat_tail_1 & 0xFF
+        raw[11] = p.mat_tail_2 & 0xFF
+
+        mat_entries.append({
+            'JointHashIndex': joint_idx,
+            'JointHash':      parser.hash_list[joint_idx],
+            'raw_body':       bytes(raw),
+        })
+    parser.material_cns = mat_entries
+
+    jxg_obj = next((o for o in root_obj.children
+                     if getattr(o, 'jcns_cns_props', None)
+                     and o.jcns_cns_props.constraint_type == 'JointExportGraph'), None)
+    parser.joint_export_graph = {'path': jxg_obj.jcns_cns_props.jxg_path} if jxg_obj else None
 
 
 _TRANSFORM_STR_TO_INT = {

@@ -26,6 +26,19 @@ KINK      = (1.00, 0.78, 0.28, 1.00)
 REST_OK   = (0.45, 0.90, 0.50, 1.00)
 REST_BAD  = (1.00, 0.30, 0.25, 1.00)
 
+# Multiple sources overlaid in one plot only read as separate curves if each
+# gets its own colour -- otherwise two sources driven off different axes
+# (e.g. X and Z) collapse into what looks like a single curve.  CURVE is kept
+# first so a single-source plot still uses the original colour.
+PALETTE = [
+    CURVE,
+    (1.00, 0.45, 0.85, 1.00),  # pink
+    (0.65, 0.45, 1.00, 1.00),  # purple
+    (0.20, 0.85, 0.75, 1.00),  # teal
+    (0.90, 0.55, 0.15, 1.00),  # orange
+    (0.85, 0.85, 0.30, 1.00),  # olive
+]
+
 
 class Canvas:
     def __init__(self, w, h, bg=BG):
@@ -114,11 +127,13 @@ def render(sources, width=180, height=110, samples=None):
         cv.vline(sx(0.0), AXIS)
 
     any_offset = False
-    for s in sources:
+    source_colours = []
+    for i, s in enumerate(sources):
         d = describe(s)
         offset = d['offset_at_rest']
         any_offset = any_offset or offset
-        colour = CURVE_BAD if offset else CURVE
+        colour = PALETTE[i % len(PALETTE)]
+        source_colours.append(colour)
         fs, fk, fe = d['from']
         ts, tk, te = d['to']
 
@@ -145,6 +160,7 @@ def render(sources, width=180, height=110, samples=None):
         'x_min': x0, 'x_max': x1, 'y_min': y0, 'y_max': y1,
         'offset_at_rest': any_offset,
         'n_sources': len(sources),
+        'source_colours': source_colours,
     }
 
 
@@ -161,3 +177,9 @@ def cache_key(sources, width, height):
                  else getattr(s, name, 0.0))
             parts.append(round(float(v), 4))
     return tuple(parts)
+
+
+def swatch(colour, width=8, height=8):
+    """A flat colour swatch, for legend icons that key a palette colour back
+    to the source it belongs to."""
+    return Canvas(width, height, bg=colour).flat()

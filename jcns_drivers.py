@@ -26,7 +26,9 @@ import bpy
 from .modules_shim import get_mapping
 
 
-# key -> {'maps': [(fs, fk, fe, ts, tk, te), …], 'combine': str}
+# key -> {'maps': [(fs, fk, fe, ts, tk, te), …]}
+# One entry per source of the single constraint that owns the channel; their
+# mapped outputs are summed.
 _CHANNELS = {}
 
 
@@ -37,26 +39,12 @@ def channel_id(armature_name, bone, transform, axis):
     return "|".join(parts)
 
 
-def register_channel(key, maps, combine):
-    _CHANNELS[key] = {'maps': list(maps), 'combine': combine}
+def register_channel(key, maps):
+    _CHANNELS[key] = {'maps': list(maps)}
 
 
 def clear_channels():
     _CHANNELS.clear()
-
-
-def _combine(values, mode):
-    if not values:
-        return 0.0
-    if mode == 'FIRST':
-        return values[0]
-    if mode == 'MAX':
-        return max(values)
-    if mode == 'MIN':
-        return min(values)
-    if mode == 'AVERAGE':
-        return sum(values) / float(len(values))
-    return sum(values)
 
 
 def jcns_ch(key, *values):
@@ -69,8 +57,9 @@ def jcns_ch(key, *values):
         return 0.0
     ev = get_mapping().eval_piecewise
     maps = ch['maps']
-    outs = [ev(*maps[i], v) for i, v in enumerate(values) if i < len(maps)]
-    return _combine(outs, ch['combine'])
+    # Each source maps independently and the outputs add up — verified in-game
+    # against a two-source constraint swept over its whole input range.
+    return sum(ev(*maps[i], v) for i, v in enumerate(values) if i < len(maps))
 
 
 def rebuild_all():
@@ -90,18 +79,17 @@ def rebuild_all():
             continue
         arm = rp.target_armature
         for (bone, transform, axis), members in group_constraints_by_channel(obj).items():
-            use_rad = (transform == 'Rotation')
+            use_rad = (transform in ('Rotation', 'UnkRotation_13'))
             maps = []
-            for empty in members:
-                for sp in empty.jcns_cns_props.sources:
-                    if not sp.source_bone:
-                        continue
-                    vals = (sp.from_start, sp.from_kink, sp.from_end,
-                            sp.to_start, sp.to_kink, sp.to_end)
-                    maps.append(tuple(math.radians(v) for v in vals) if use_rad else vals)
+            # Only the last constraint on a channel is live; see _apply_channel.
+            for sp in members[-1].jcns_cns_props.sources:
+                if not sp.source_bone:
+                    continue
+                vals = (sp.from_start, sp.from_kink, sp.from_end,
+                        sp.to_start, sp.to_kink, sp.to_end)
+                maps.append(tuple(math.radians(v) for v in vals) if use_rad else vals)
             if maps:
-                register_channel(channel_id(arm.name, bone, transform, axis),
-                                 maps, rp.source_combine)
+                register_channel(channel_id(arm.name, bone, transform, axis), maps)
                 rebuilt += 1
     return rebuilt
 

@@ -106,29 +106,18 @@ def describe(source):
     }
 
 
-def combine_values(values, mode):
-    """Fold several mapped outputs into the one value a channel produces."""
-    if not values:
-        return 0.0
-    if mode == 'FIRST':
-        return values[0]
-    if mode == 'MAX':
-        return max(values)
-    if mode == 'MIN':
-        return min(values)
-    if mode == 'AVERAGE':
-        return sum(values) / float(len(values))
-    return sum(values)
+def describe_channel(sources):
+    """Diagnose a driven channel from the sources of the constraint that owns it.
 
+    A single source can look harmless while the total is still deflected at rest,
+    so the per-source read-out is not sufficient on its own.
 
-def describe_channel(sources, combine='SUM'):
-    """Diagnose a whole driven channel — every source of every constraint on it.
-
-    A single source can look harmless while the channel total is still deflected
-    at rest, so the per-source read-out is not sufficient on its own.
+    Pass only the live constraint's sources: where several constraints target one
+    channel the engine keeps the last and drops the rest, so folding all of them
+    in here would report a rest deflection that never actually happens.
     """
     infos = [describe(s) for s in sources]
-    at_rest = combine_values([i['at_rest'] for i in infos], combine)
+    at_rest = sum(i['at_rest'] for i in infos)
     return {
         'at_rest': at_rest,
         'offset_at_rest': abs(at_rest) > 1e-4,

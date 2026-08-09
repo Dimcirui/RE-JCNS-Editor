@@ -147,9 +147,8 @@ class JCNSParser:
                                         rather than identity, so this is a real rest pose, not padding.
     Total: 72 bytes
 
-    Field-frequency claims above were measured over the 884 shipped .jcns.102 files in
-    E:\\Desktop\\natives\\JCNS-natives (19884 constraints / 23031 sources) by
-    REE-JCNS-Research/scripts/corpus_stats.  Every non-constant field listed here is
+    Field-frequency claims above were measured over 884 shipped .jcns.102 files
+    (19884 constraints / 23031 sources).  Every non-constant field listed here is
     round-tripped verbatim by jcns_writer; the defaults it falls back to apply only to
     newly created constraints.
 

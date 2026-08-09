@@ -13,3 +13,5 @@ RE_Engine_JCNS_new.bt
 RE_Engine_JCNS_old.bt
 # Build artifacts
 *.zip
+modules/pattern_finder.py
+tests/

@@ -11,16 +11,16 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 bl_info = {
-    "name": "RE Engine JCNS Editor",
-    "author": "JCNS Reverse Engineering Project",
-    "version": (0, 12, 0),
+    "name": "Wilds JCNS Editor",
+    "author": "Dimcirui",
+    "version": (0, 13, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > JCNS Editor | File > Import/Export",
     "description": (
-        "Import, edit, and export RE Engine JCNS joint constraint files "
-        "for Monster Hunter Wilds (v102). Each imported file creates a green "
-        "collection with one Empty per constraint, each carrying its full list "
-        "of driving sources."
+        "Import, edit, and export JCNS joint constraint files for Monster "
+        "Hunter Wilds (v102). Each imported file creates a green collection "
+        "with one Empty per constraint, each carrying its full list of "
+        "driving sources."
     ),
     "category": "Animation",
 }
@@ -126,18 +126,47 @@ def _refresh_driver_values(self, context):
         print("[JCNS] driver value refresh skipped: %r" % exc)
 
 
-def _refresh_driver(self, context):
-    """Keep an already-applied driver in step with the value being edited.
+def _sync_constraint_name(self):
+    """Re-derive this constraint's Empty name from its own current properties.
 
-    Without this the rig keeps showing the curve as it was when Apply was last
-    pressed, because the driver reads anchors baked into the channel table.
-    Does nothing when no driver is applied, so it costs nothing while authoring.
+    Only touches this one Empty and keeps its existing '[N]' index — renumbering
+    everyone is a separate, deliberate step (see JCNS_OT_DeleteConstraint and
+    JCNS_OT_MirrorConstraints), not a side effect of editing a field.
+    """
+    obj = self.id_data
+    if obj is None:
+        return
+    p = getattr(obj, 'jcns_cns_props', None)
+    if p is None or not p.is_jcns_constraint:
+        return
+    idx = 0
+    if obj.name.startswith('['):
+        try:
+            idx = int(obj.name[1:obj.name.index(']')])
+        except (ValueError, IndexError):
+            pass
+    obj.name = constraint_name_from_props(idx, p)
+
+
+def _refresh_driver(self, context):
+    """Keep an already-applied driver in step with the value being edited, and
+    keep the Empty's name in sync — this callback is only used by the fields
+    (bone / axis / transform type) that the display name is built from.
+
+    Without the driver refresh the rig keeps showing the curve as it was when
+    Apply was last pressed, because the driver reads anchors baked into the
+    channel table. Does nothing when no driver is applied, so it costs nothing
+    while authoring.
     """
     try:
         from . import jcns_operators
         jcns_operators.refresh_applied_driver(self.id_data)
     except Exception as exc:                     # an edit must never hard-fail
         print("[JCNS] driver refresh skipped: %r" % exc)
+    try:
+        _sync_constraint_name(self)
+    except Exception as exc:
+        print("[JCNS] name refresh skipped: %r" % exc)
 
 
 def _search_bone_names(context, edit_text):
@@ -241,11 +270,23 @@ class JCNSSourceProperties(PropertyGroup):
     rest_quat_w: FloatProperty(name="Quat W", default=1.0, precision=5)
 
     # --- Raw bytes ---
+    # Both default to 3, the mode among the 4916 sources of real bone rotation
+    # constraints in the shipped corpus (+24=ConstraintEnd at 69%, +25=93%).
+    #
+    # For +24 that also agrees with the flags default below: bit0 starts set
+    # (additive), and additive constraints read their source at ConstraintEnd
+    # 80.6% of the time, while override ones read early (MotionBegin +
+    # ConstraintBegin, 81.5%).  Reading late is what lets an additive result
+    # layer onto a settled pose, so a bit0=1 / +24=3 pair is self-consistent.
+    # If you clear bit0 to make a constraint override, an early +24 is the
+    # matching choice.
     update_timing: IntProperty(
         name="更新时机 (+24)",
         description=(
             "ConstraintSource_v2 byte +24. Meaning unconfirmed — bt 0.65.14 reads it as "
-            "UpdateTimingID: " + UPDATE_TIMING_HINT + ". Observed values: 0..5"
+            "UpdateTimingID: " + UPDATE_TIMING_HINT + ". Observed values: 0..5. "
+            "Correlates strongly with flags bit0: override constraints read early "
+            "(MotionBegin/ConstraintBegin), additive ones read at ConstraintEnd"
         ),
         default=3, min=0, max=255,
     )
@@ -255,7 +296,8 @@ class JCNSSourceProperties(PropertyGroup):
             "ConstraintSource_v2 byte +25. Meaning UNCONFIRMED and disputed: bt 0.65.13 read "
             "it as InterpolationID (0..6), bt 0.65.14 reads it as TransformIDSrc (0..4). "
             "Observed values across 884 files are 0..5 — value 5 fits neither reading "
-            "cleanly. Change only if you know what you are doing"
+            "cleanly. Tracks the transform type rather than anything about how sources "
+            "combine — 93% of rotation sources use 3. Change only if you know what you are doing"
         ),
         default=3, min=0, max=255,
     )
@@ -325,10 +367,10 @@ class JCNSConstraintProperties(PropertyGroup):
     # flags_cns: editable int + 8 bit checkboxes (bidirectional sync via update callbacks)
     cns_flags: IntProperty(
         name="标志位", description="bt: flags_cns。位4（驱动骨骼）与位5（驱动量为旋转）在导出时会按变换类型自动重算；位0 保留你的设置",
-        default=0x30, min=0, max=255, update=_update_bits_from_flags,
+        default=0x31, min=0, max=255, update=_update_bits_from_flags,
     )
     flags_expanded: BoolProperty(name="展开标志位", default=False)
-    flag_bit_0: BoolProperty(name="Bit0 — isAdd?",  default=False, update=_update_flags_from_bits)
+    flag_bit_0: BoolProperty(name="Bit0 — isAdd?",  default=True,  update=_update_flags_from_bits)
     flag_bit_1: BoolProperty(name="Bit1",            default=False, update=_update_flags_from_bits)
     flag_bit_2: BoolProperty(name="Bit2",            default=False, update=_update_flags_from_bits)
     flag_bit_3: BoolProperty(name="Bit3",            default=False, update=_update_flags_from_bits)
@@ -354,8 +396,12 @@ class JCNSConstraintProperties(PropertyGroup):
         name="ConeDriverInfoCount", description="bt: ConeDriverInfoCount — usually 0",
         default=0, min=0, max=255,
     )
+    # Of these six, only [1] (+75) and [3] (+77) ever hold anything: [2]/[4]/[5]
+    # are zero in all 19884 shipped constraints and [0] in 98.8% of them.
+    # [1]=2 is both the corpus mode (70%) and what the verified hand-authored
+    # file uses; [3]=0 likewise.
     parent_tail_0: IntProperty(name="Tail[0]", default=0, min=0, max=255)
-    parent_tail_1: IntProperty(name="Tail[1]", default=0, min=0, max=255)
+    parent_tail_1: IntProperty(name="Tail[1]", default=2, min=0, max=255)
     parent_tail_2: IntProperty(name="Tail[2]", default=0, min=0, max=255)
     parent_tail_3: IntProperty(name="Tail[3]", default=0, min=0, max=255)
     parent_tail_4: IntProperty(name="Tail[4]", default=0, min=0, max=255)
@@ -443,25 +489,15 @@ class JCNSRootProperties(PropertyGroup):
         description="Base64 of section table data from source file",
         default="",
     )
-    source_combine: EnumProperty(
-        update=_refresh_driver,
-        name="多源合并",
-        description=(
-            "How several mapped outputs driving the SAME bone axis are folded into "
-            "one value. This covers both a constraint with multiple sources and "
-            "several constraints targeting the same channel. The engine's real rule "
-            "is NOT yet reverse-engineered — compare against an in-game capture "
-            "before trusting any of these"
-        ),
-        items=[
-            ('SUM',     "求和",   "把各路输出相加"),
-            ('MAX',     "取最大", "取最大的那一路输出"),
-            ('MIN',     "取最小", "取最小的那一路输出"),
-            ('AVERAGE', "平均",   "所有输出的平均值"),
-            ('FIRST',   "仅第一路", "只用第一个驱动源，忽略其余"),
-        ],
-        default='SUM',
-    )
+    # There used to be a `source_combine` enum here (SUM/MAX/MIN/AVERAGE/FIRST)
+    # because the engine's folding rule was unknown.  It is known now, measured
+    # in-game by sweeping synthetic driver bones across their whole input range:
+    #
+    #   several sources in ONE constraint  -> each maps independently, outputs SUM
+    #   several constraints on ONE channel -> the LAST in file order wins outright
+    #
+    # Both are fixed behaviour, so there is nothing left for the user to choose,
+    # and leaving the enum in place would only invite mis-configuration.
     detected_game: EnumProperty(
         name="游戏",
         description="Game this JCNS file belongs to (detected at import)",
@@ -515,6 +551,45 @@ def get_jcns_root_from_constraint(constraint_empty):
             root_props = getattr(obj, 'jcns_root_props', None)
             if root_props and root_props.source_filepath:
                 return obj, root_props
+    return None, None
+
+
+def get_jcns_root_from_collection(collection):
+    """Find the JCNS root Empty inside a Collection, or (None, None).
+
+    Each import creates exactly one root per collection, so a plain scan is
+    enough — no parent/child walk needed here since we start from the
+    collection itself.
+    """
+    if collection is None:
+        return None, None
+    for obj in collection.objects:
+        root_props = getattr(obj, 'jcns_root_props', None)
+        if root_props and root_props.source_filepath:
+            return obj, root_props
+    return None, None
+
+
+def get_export_root(context):
+    """(root, root_props) that operators like export should act on.
+
+    The scene's "工作集合" (active collection) wins when set, so export is
+    reachable from anywhere in the scene without hunting down the right
+    Empty first. With nothing set, falls back to whatever JCNS object is
+    currently selected — the previous, only, behaviour.
+    """
+    coll = getattr(context.scene, 'jcns_active_collection', None)
+    if coll is not None:
+        root, root_props = get_jcns_root_from_collection(coll)
+        if root is not None:
+            return root, root_props
+
+    root, root_props = get_jcns_root(context)
+    if root is not None:
+        return root, root_props
+    cns_obj, _ = get_jcns_constraint(context)
+    if cns_obj is not None:
+        return get_jcns_root_from_constraint(cns_obj)
     return None, None
 
 
@@ -623,6 +698,12 @@ from . import jcns_exporter
 from . import jcns_ui
 from . import jcns_drivers
 
+def _poll_jcns_collection(self, collection):
+    """Restrict the active-collection picker to collections that hold a JCNS root."""
+    root, _ = get_jcns_root_from_collection(collection)
+    return root is not None
+
+
 _classes = [
     JCNSSourceProperties,       # must register before the group that references it
     JCNSConstraintProperties,
@@ -636,6 +717,12 @@ def register():
 
     bpy.types.Object.jcns_root_props = PointerProperty(type=JCNSRootProperties)
     bpy.types.Object.jcns_cns_props  = PointerProperty(type=JCNSConstraintProperties)
+    bpy.types.Scene.jcns_active_collection = PointerProperty(
+        type=bpy.types.Collection,
+        name="工作集合",
+        description="导出等操作默认作用的 JCNS 集合。留空则改用当前选中的物体",
+        poll=_poll_jcns_collection,
+    )
 
     jcns_operators.register()
     jcns_importer.register()
@@ -651,6 +738,7 @@ def unregister():
     jcns_importer.unregister()
     jcns_operators.unregister()
 
+    del bpy.types.Scene.jcns_active_collection
     del bpy.types.Object.jcns_cns_props
     del bpy.types.Object.jcns_root_props
 

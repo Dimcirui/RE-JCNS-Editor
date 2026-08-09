@@ -119,9 +119,12 @@ _COMBINE_OPS = {
 _AXIS_NAME = ['X', 'Y', 'Z', 'W']
 
 _DRIVABLE = {
-    'Translation': ('location',        ['LOC_X', 'LOC_Y', 'LOC_Z'],     False),
-    'Rotation':    ('rotation_euler',  ['ROT_X', 'ROT_Y', 'ROT_Z'],     True),
-    'Scale':       ('scale',           ['SCALE_X', 'SCALE_Y', 'SCALE_Z'], False),
+    'Translation':     ('location',        ['LOC_X', 'LOC_Y', 'LOC_Z'],     False),
+    'Rotation':        ('rotation_euler',  ['ROT_X', 'ROT_Y', 'ROT_Z'],     True),
+    'Scale':           ('scale',           ['SCALE_X', 'SCALE_Y', 'SCALE_Z'], False),
+    # Unresolved variant seen driving cloth-offset bones; treated as a plain
+    # Euler rotation until its actual semantics are reverse-engineered.
+    'UnkRotation_13':  ('rotation_euler',  ['ROT_X', 'ROT_Y', 'ROT_Z'],     True),
 }
 
 
@@ -141,11 +144,12 @@ def _sources_for_driver(cns_props):
 
 
 def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
-                  sources, transform_type='Rotation', combine='SUM'):
+                  sources, transform_type='Rotation'):
     """
     Install (or replace) the SCRIPTED driver for one channel of one pose bone.
 
-    `sources` is a list of dicts, one per ConstraintSource_v2:
+    `sources` is a list of dicts, one per ConstraintSource_v2 of a SINGLE
+    constraint — they map independently and their outputs are summed:
         {bone, axis_idx, from_start, from_kink, from_end,
                          to_start,   to_kink,   to_end}
 
@@ -170,7 +174,7 @@ def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
     if not usable:
         return False, "未设置驱动骨骼"
 
-    if transform_type == 'Rotation' and pose_bone.rotation_mode not in _EULER_MODES:
+    if data_path == 'rotation_euler' and pose_bone.rotation_mode not in _EULER_MODES:
         pose_bone.rotation_mode = 'XYZ'
 
     # Anchors in the driver's own units, so the namespace function converts nothing.
@@ -182,7 +186,7 @@ def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
 
     key = jcns_drivers.channel_id(armature_obj.name, target_bone_name,
                                   transform_type, _AXIS_NAME[target_axis_idx])
-    jcns_drivers.register_channel(key, maps, combine)
+    jcns_drivers.register_channel(key, maps)
 
     pose_bone.driver_remove(data_path, target_axis_idx)
     armature_obj.animation_data_create()
@@ -214,10 +218,9 @@ def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
         return False, ("channel key too long (%d chars) — rename the bone or "
                        "armature" % len(expr))
 
-    print("[JCNS DRIVER] [%s] %d source(s) %s -> %s[%d]  combine=%s  expr=%s" % (
+    print("[JCNS DRIVER] [%s] %d source(s) %s -> %s[%d]  expr=%s" % (
         transform_type, len(usable), ", ".join(s['bone'] for s in usable),
-        target_bone_name, target_axis_idx,
-        combine if len(usable) > 1 else 'n/a', expr))
+        target_bone_name, target_axis_idx, expr))
     return True, ""
 
 
@@ -291,21 +294,21 @@ def refresh_channel_values(obj):
         return False
     use_radians = entry[2]
 
+    # Only the last constraint on the channel is live — see _apply_channel.
     maps = []
-    for e in members:
-        for s in _sources_for_driver(e.jcns_cns_props):
-            if not s['bone']:
-                continue
-            vals = (s['from_start'], s['from_kink'], s['from_end'],
-                    s['to_start'],   s['to_kink'],   s['to_end'])
-            maps.append(tuple(math.radians(v) for v in vals) if use_radians
-                        else tuple(vals))
+    for s in _sources_for_driver(members[-1].jcns_cns_props):
+        if not s['bone']:
+            continue
+        vals = (s['from_start'], s['from_kink'], s['from_end'],
+                s['to_start'],   s['to_kink'],   s['to_end'])
+        maps.append(tuple(math.radians(v) for v in vals) if use_radians
+                    else tuple(vals))
     if not maps:
         return False
 
     key = jcns_drivers.channel_id(rp.target_armature.name, p.target_bone,
                                   p.transform_type, p.target_axis)
-    jcns_drivers.register_channel(key, maps, rp.source_combine)
+    jcns_drivers.register_channel(key, maps)
     rp.target_armature.update_tag()
     return True
 
@@ -365,22 +368,30 @@ def refresh_applied_driver(obj):
 
 
 def _apply_channel(armature_obj, root_props, members):
-    """Apply one merged driver for every constraint sharing a channel.
+    """Apply the driver for one channel, following the engine's two rules.
 
-    `members` are constraint Empties with identical (bone, transform, axis).
-    Their sources are concatenated so a channel driven by several constraint
-    blocks produces one driver holding all of them, rather than each apply
-    silently overwriting the last.
+    `members` are constraint Empties with identical (bone, transform, axis), in
+    file order.  Measured against an in-game capture (see
+    REE-JCNS-Research/scripts/corpus_stats):
+
+      * several constraints on one channel — only the LAST one in file order has
+        any effect; the earlier ones are discarded outright.
+      * several sources inside one constraint — each maps independently and the
+        outputs are SUMMED.
+
+    So the driver is built from the winning constraint alone.  Concatenating
+    every member's sources, as this used to do, made earlier constraints
+    contribute when the engine ignores them entirely.
     """
     from . import AXIS_TO_INT
     bone, transform, axis = _channel_of(members[0])
 
-    sources = []
-    for empty in members:
-        sources.extend(_sources_for_driver(empty.jcns_cns_props))
+    winner = members[-1]
+    sources = _sources_for_driver(winner.jcns_cns_props)
 
-    label = "%s(%s) <- %d source(s) from %d constraint(s)" % (
-        bone or '???', axis, len(sources), len(members))
+    label = "%s(%s) <- %d source(s)" % (bone or '???', axis, len(sources))
+    if len(members) > 1:
+        label += "，同通道 %d 条中最后一条生效" % len(members)
 
     if not sources:
         return False, "没有驱动源", label
@@ -391,7 +402,7 @@ def _apply_channel(armature_obj, root_props, members):
 
     ok, err = _apply_driver(
         armature_obj, bone, AXIS_TO_INT.get(axis, 0), sources,
-        transform_type=transform, combine=root_props.source_combine,
+        transform_type=transform,
     )
     if ok:
         for empty in members:
@@ -532,6 +543,81 @@ class JCNS_OT_ClearAllDrivers(Operator):
 
 
 # ---------------------------------------------------------------------------
+# Duplicate-index bookkeeping
+# ---------------------------------------------------------------------------
+#
+# Native Blender duplication (Shift+D, Ctrl+C/V, Outliner duplicate, Alt+D, ...)
+# copies jcns_cns_props verbatim, including whatever '[N]' text was baked into
+# the source Empty's name. Blender itself only guarantees obj.name is unique
+# (appending '.001'), so right after duplicating, two Ranges Empties can carry
+# the exact same parsed index. get_constraint_empties() sorts by that same
+# text, so which of the two sorts first is then decided by root_obj.children
+# order rather than anything meaningful — and any operator that renumbers by
+# position from that order (JCNS_OT_MirrorConstraints, JCNS_OT_DeleteConstraint)
+# can then shuffle an unrelated Empty's index. A depsgraph handler below fixes
+# collisions the moment they appear, before anything else has a chance to run.
+
+def dedupe_constraint_indices(root_obj):
+    """Give every duplicate '[N]' index directly under root_obj a free number.
+
+    Only ever touches Empties that are actually colliding (or unparsable);
+    a file with no collisions is left completely untouched, so this is safe
+    to call opportunistically. Returns how many Empties were renumbered.
+    """
+    from . import get_constraint_empties, constraint_name_from_props
+
+    def parsed_index(obj):
+        name = obj.name
+        if name.startswith('['):
+            try:
+                return int(name[1:name.index(']')])
+            except (ValueError, IndexError):
+                pass
+        return None
+
+    empties = get_constraint_empties(root_obj)
+    next_free = 0
+    for obj in empties:
+        idx = parsed_index(obj)
+        if idx is not None:
+            next_free = max(next_free, idx + 1)
+
+    seen = set()
+    fixed = 0
+    for obj in empties:
+        idx = parsed_index(obj)
+        if idx is not None and idx not in seen:
+            seen.add(idx)
+            continue
+        obj.name = constraint_name_from_props(next_free, obj.jcns_cns_props)
+        seen.add(next_free)
+        next_free += 1
+        fixed += 1
+    return fixed
+
+
+@bpy.app.handlers.persistent
+def _on_depsgraph_update_fix_duplicates(scene, depsgraph):
+    try:
+        from . import get_jcns_root_from_constraint
+        roots = set()
+        for update in depsgraph.updates:
+            obj = update.id
+            if not isinstance(obj, bpy.types.Object):
+                continue
+            props = getattr(obj, 'jcns_cns_props', None)
+            if not (props and props.is_jcns_constraint):
+                continue
+            root_obj, _ = get_jcns_root_from_constraint(obj)
+            if root_obj is not None:
+                roots.add(root_obj)
+        for root_obj in roots:
+            dedupe_constraint_indices(root_obj)
+    except Exception as exc:                     # a handler must never hard-fail
+        print("[JCNS] duplicate-index fix skipped: %r" % exc)
+
+
+# ---------------------------------------------------------------------------
 # Operator: Add Constraint
 # ---------------------------------------------------------------------------
 
@@ -603,7 +689,7 @@ class JCNS_OT_DeleteConstraint(Operator):
 
     def execute(self, context):
         from . import (get_jcns_constraint, get_jcns_root_from_constraint,
-                       get_constraint_empties, constraint_name_from_props)
+                       get_constraint_empties)
 
         cns_obj, cns_props = get_jcns_constraint(context)
         root_obj, root_props = get_jcns_root_from_constraint(cns_obj)
@@ -613,13 +699,86 @@ class JCNS_OT_DeleteConstraint(Operator):
 
         # Reindex remaining Empties
         if root_obj:
-            remaining = get_constraint_empties(root_obj)
-            for new_idx, empty in enumerate(remaining):
-                empty.name = constraint_name_from_props(new_idx, empty.jcns_cns_props)
+            _renumber_in_order(get_constraint_empties(root_obj))
 
         self.report({'INFO'}, "约束已删除，其余已重新编号。")
         return {'FINISHED'}
 
+
+# ---------------------------------------------------------------------------
+# Operator: Move Constraint
+# ---------------------------------------------------------------------------
+
+def _renumber_in_order(ordered):
+    """Rewrite every Empty's '[N]' prefix to match its position in `ordered`.
+
+    Done in two passes because Blender silently appends '.001' when a name is
+    already taken.  Two constraints driving the same channel differ only by that
+    prefix, so assigning final names in one pass would mangle exactly the case
+    reordering exists for.
+    """
+    from . import constraint_name_from_props
+
+    for i, empty in enumerate(ordered):
+        empty.name = "__jcns_reorder_%d" % i
+    for i, empty in enumerate(ordered):
+        empty.name = constraint_name_from_props(i, empty.jcns_cns_props)
+
+
+class JCNS_OT_MoveConstraint(Operator):
+    """Move the selected constraint one slot earlier or later in the file
+
+    Order is not cosmetic: constraints are written out in '[N]' order, and where
+    several of them drive the same bone axis the engine keeps the last one, so
+    moving a constraint down past its siblings is what makes it the winner.
+    """
+    bl_idname = "jcns.move_constraint"
+    bl_label  = "移动约束"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(
+        name="方向",
+        items=[('UP', "上移", "往文件前面挪一位"),
+               ('DOWN', "下移", "往文件后面挪一位")],
+        default='UP',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        from . import get_jcns_constraint
+        obj, _ = get_jcns_constraint(context)
+        return obj is not None
+
+    def execute(self, context):
+        from . import (get_jcns_constraint, get_jcns_root_from_constraint,
+                       get_constraint_empties)
+
+        cns_obj, _ = get_jcns_constraint(context)
+        root_obj, _ = get_jcns_root_from_constraint(cns_obj)
+        if root_obj is None:
+            self.report({'ERROR'}, "找不到所属的 JCNS 根节点。")
+            return {'CANCELLED'}
+
+        ordered = get_constraint_empties(root_obj)
+        try:
+            pos = ordered.index(cns_obj)
+        except ValueError:
+            # Aim / RotExpression / Material Empties are not part of the ordered
+            # constraint list, so there is nothing to move them within.
+            self.report({'ERROR'}, "该类型的约束不参与排序。")
+            return {'CANCELLED'}
+
+        new_pos = pos - 1 if self.direction == 'UP' else pos + 1
+        if not (0 <= new_pos < len(ordered)):
+            edge = "最前面" if self.direction == 'UP' else "最后面"
+            self.report({'INFO'}, "已经在%s了。" % edge)
+            return {'CANCELLED'}
+
+        ordered[pos], ordered[new_pos] = ordered[new_pos], ordered[pos]
+        _renumber_in_order(ordered)
+
+        self.report({'INFO'}, "已移动到第 %d 位（共 %d 条）。" % (new_pos + 1, len(ordered)))
+        return {'FINISHED'}
 
 
 class JCNS_OT_AddSource(Operator):
@@ -724,11 +883,25 @@ class JCNS_OT_MirrorConstraints(Operator):
 
     符号由骨骼的局部坐标系决定，并区分驱动量的类型：旋转是赝矢量、位移是普通
     矢量，两者镜像方式相反；缩放与形变权重不带符号，永不取反。
+
+    目标和来源是否翻转到对侧是两个独立的开关：一条约束里目标骨骼和驱动来源
+    未必都是"有侧"的——比如一根中线骨骼分别被 L_Thigh 和 R_Thigh 各驱动一条
+    约束，这时只该镜像来源，目标保持原样。关闭对应开关的那一侧不要求存在对
+    侧骨骼，也不会被当作"无法确定符号"报错。
     """
     bl_idname = "jcns.mirror_constraints"
     bl_label  = "镜像到另一侧"
     bl_options = {'REGISTER', 'UNDO'}
 
+    mirror_target: BoolProperty(
+        name="镜像目标骨骼", default=True,
+        description="把目标骨骼也翻转到对侧。关闭后目标骨骼保持不变——用于"
+                    "目标是中线/共享骨骼（没有 L/R 配对），只有驱动来源需要"
+                    "换到对侧的情况")
+    mirror_source: BoolProperty(
+        name="镜像驱动来源", default=True,
+        description="把每个驱动来源骨骼也翻转到对侧。关闭后驱动来源保持不变"
+                    "——用于来源是中线/共享骨骼，只有目标需要换到对侧的情况")
     overwrite: BoolProperty(
         name="覆盖已有数值", default=False,
         description="对侧若已存在同名约束，是否用镜像结果覆盖它的数值。"
@@ -747,11 +920,16 @@ class JCNS_OT_MirrorConstraints(Operator):
 
     def draw(self, context):
         layout = self.layout
+        row = layout.row(align=True)
+        row.prop(self, "mirror_target")
+        row.prop(self, "mirror_source")
         layout.prop(self, "use_frames")
         layout.prop(self, "overwrite")
         col = layout.column(align=True)
         col.label(text="符号由骨骼坐标系与驱动量类型决定", icon='INFO')
         col.label(text="旋转与位移的镜像方式相反，已自动区分")
+        if not (self.mirror_target or self.mirror_source):
+            col.label(text="目标与来源至少要镜像一项", icon='ERROR')
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self)
@@ -760,6 +938,10 @@ class JCNS_OT_MirrorConstraints(Operator):
         from . import (get_jcns_constraint, get_jcns_root_from_constraint,
                        get_constraint_empties, constraint_name_from_props)
         from .modules_shim import get_mirror
+
+        if not self.mirror_target and not self.mirror_source:
+            self.report({'ERROR'}, "目标与来源至少要镜像一项。")
+            return {'CANCELLED'}
 
         active, _ = get_jcns_constraint(context)
         root_obj, root_props = get_jcns_root_from_constraint(active)
@@ -817,21 +999,35 @@ class JCNS_OT_MirrorConstraints(Operator):
 
         for e in targets:
             p = e.jcns_cns_props
-            new_tgt = partner(p.target_bone)
-            if new_tgt is None:
-                problems.append("%s 没有对侧骨骼" % (p.target_bone or "?"))
-                continue
 
-            tgt_sigma = sigma(p.target_bone)
+            if self.mirror_target:
+                new_tgt = partner(p.target_bone)
+                if new_tgt is None:
+                    problems.append("%s 没有对侧骨骼" % (p.target_bone or "?"))
+                    continue
+                tgt_sigma = sigma(p.target_bone)
+            else:
+                # Target is fixed (e.g. a centre-line bone) — keep it as-is,
+                # no counterpart lookup and no sigma needed for that side.
+                new_tgt = p.target_bone
+                tgt_sigma = None
+
             new_sources, failed = [], None
             for sp in p.sources:
-                mate = partner(sp.source_bone)
-                if mate is None:
-                    failed = "%s 没有对侧骨骼" % sp.source_bone
-                    break
+                if self.mirror_source:
+                    mate = partner(sp.source_bone)
+                    if mate is None:
+                        failed = "%s 没有对侧骨骼" % sp.source_bone
+                        break
+                    src_sigma = sigma(sp.source_bone)
+                else:
+                    # Source is fixed — same reasoning as the target above.
+                    mate = sp.source_bone
+                    src_sigma = None
                 vals, i_s, o_s = mirror.mirror_source(
                     sp, sp.source_axis, p.target_axis, p.cns_flags,
-                    sigma(sp.source_bone), tgt_sigma, p.transform_type)
+                    src_sigma, tgt_sigma, p.transform_type,
+                    mirror_in=self.mirror_source, mirror_out=self.mirror_target)
                 if vals is None:
                     failed = "%s 的 %s 轴无法确定镜像符号" % (sp.source_bone,
                                                              sp.source_axis)
@@ -1001,6 +1197,7 @@ _classes = [
     JCNS_OT_ClearAllDrivers,
     JCNS_OT_AddConstraint,
     JCNS_OT_DeleteConstraint,
+    JCNS_OT_MoveConstraint,
     JCNS_OT_AddSource,
     JCNS_OT_RemoveSource,
     JCNS_OT_SwapMapToEnds,
@@ -1014,7 +1211,13 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
 
+    if _on_depsgraph_update_fix_duplicates not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update_fix_duplicates)
+
 
 def unregister():
+    if _on_depsgraph_update_fix_duplicates in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update_fix_duplicates)
+
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

@@ -106,12 +106,22 @@ def is_angular_output(transform_type, flags=None):
 
 
 def signs_for(source_axis, target_axis, flags, src_sigma=None, tgt_sigma=None,
-              transform_type='Rotation'):
+              transform_type='Rotation', mirror_in=True, mirror_out=True):
     """(in_sign, out_sign) for one source of one constraint.
 
     `src_sigma` / `tgt_sigma` are the per-axis dicts from sigma_from_frames() for
     the source and target bones; SIGMA_DEFAULT is used where they are missing.
     Returns (None, None) when either axis has no usable sign.
+
+    `mirror_in` / `mirror_out` say whether the source side / target side is
+    actually being reflected to a different bone at all. A constraint can be
+    "mirrored" on only one side — e.g. a centre-line bone (no L/R pair) driven
+    independently from both thighs: the target stays put and only the source
+    flips L_Thigh -> R_Thigh. The side that is not flipping keeps its value
+    as-is (sign +1); the vector/pseudovector distinction below only matters
+    where a reflection is actually happening, so it is skipped entirely for a
+    fixed side rather than defaulting to SIGMA_DEFAULT (which describes a real
+    mirror pair, not "unchanged").
 
     sigma_from_frames() reports the PSEUDOVECTOR sign, which is what a rotation
     follows.  A position is an ordinary vector and mirrors the other way round —
@@ -124,9 +134,18 @@ def signs_for(source_axis, target_axis, flags, src_sigma=None, tgt_sigma=None,
     (6271 of 7451 pairs), because the bit merely tracks the transform type — but
     only this one explains *why*.
     """
-    ss = (src_sigma or SIGMA_DEFAULT).get(source_axis)
+    if mirror_in:
+        ss = (src_sigma or SIGMA_DEFAULT).get(source_axis)
+        if ss is None:
+            return None, None
+    else:
+        ss = +1
+
+    if not mirror_out:
+        return ss, +1
+
     ts = (tgt_sigma or SIGMA_DEFAULT).get(target_axis)
-    if ss is None or ts is None:
+    if ts is None:
         return None, None
     # The source is read as a bone rotation, so the input always uses sigma.
     if transform_type in UNSIGNED_OUTPUT_TYPES:
@@ -156,11 +175,12 @@ def mirror_triples(from_triple, to_triple, in_sign, out_sign):
 
 
 def mirror_source(source, source_axis, target_axis, flags,
-                  src_sigma=None, tgt_sigma=None, transform_type='Rotation'):
+                  src_sigma=None, tgt_sigma=None, transform_type='Rotation',
+                  mirror_in=True, mirror_out=True):
     """Mirror one source mapping. Returns (dict_of_anchors, in_sign, out_sign).
 
     The signs are handed back so the UI can show what was applied and how much
-    to trust it.
+    to trust it. `mirror_in` / `mirror_out` — see signs_for().
     """
     def g(name):
         if isinstance(source, dict):
@@ -168,7 +188,8 @@ def mirror_source(source, source_axis, target_axis, flags,
         return float(getattr(source, name, 0.0))
 
     in_sign, out_sign = signs_for(source_axis, target_axis, flags,
-                                  src_sigma, tgt_sigma, transform_type)
+                                  src_sigma, tgt_sigma, transform_type,
+                                  mirror_in, mirror_out)
     if in_sign is None:
         return None, None, None
 
