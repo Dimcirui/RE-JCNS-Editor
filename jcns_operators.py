@@ -42,7 +42,7 @@ _SCALE_TYPE = ['SCALE_X', 'SCALE_Y', 'SCALE_Z']
 
 def _build_piecewise_expr(from_start, from_kink, from_end,
                            to_start,   to_kink,   to_end,
-                           use_radians=True, var='var'):
+                           use_radians=True, var='var', two_point=False):
     """
     Build a Blender SCRIPTED driver expression implementing the three-point
     piecewise linear mapping.
@@ -73,18 +73,27 @@ def _build_piecewise_expr(from_start, from_kink, from_end,
 
     span1 = fk - fs
     span2 = fe - fk
+    total = fe - fs
 
-    # Both segments degenerate → constant output
+    # two_point selects the +24 == 0 curve mode: the engine ignores the kink and
+    # runs the straight line A -> C.  Measured in-game 2026-08-21; keep in sync
+    # with modules.jcns_mapping.eval_piecewise, which documents the evidence.
+    if two_point:
+        if abs(total) < 1e-9:
+            return "0.000000"
+        k = (te - ts) / total
+        lo, hi = min(ts, te), max(ts, te)
+        return f"max({lo:.6f}, min({hi:.6f}, {ts:.6f} + ({var} - {fs:.6f}) * {k:.6f}))"
+
+    # Three-point mode.  Degenerate handling below was measured in-game
+    # (Round 12); the fully-collapsed case steps between to_start and to_end and
+    # never yields to_kink.  Keep the ternary parenthesised — see the note below.
     if abs(span1) < 1e-9 and abs(span2) < 1e-9:
-        return f"{ts:.6f}"
-
-    # Only seg1 active (from_kink == from_end)
+        return f"(({ts:.6f}) if {var} <= {fk:.6f} else ({te:.6f}))"
     if abs(span2) < 1e-9:
         k1 = (tk - ts) / span1
         lo, hi = min(ts, tk), max(ts, tk)
         return f"max({lo:.6f}, min({hi:.6f}, {ts:.6f} + ({var} - {fs:.6f}) * {k1:.6f}))"
-
-    # Only seg2 active (from_start == from_kink)
     if abs(span1) < 1e-9:
         k2 = (te - tk) / span2
         lo, hi = min(tk, te), max(tk, te)
@@ -139,6 +148,8 @@ def _sources_for_driver(cns_props):
             'axis_name':  sp.source_axis,
             'from_start': sp.from_start, 'from_kink': sp.from_kink, 'from_end': sp.from_end,
             'to_start':   sp.to_start,   'to_kink':   sp.to_kink,   'to_end':   sp.to_end,
+            # +24 selects the curve mode; see modules.jcns_mapping.is_two_point.
+            'update_timing': sp.update_timing,
         })
     return out
 
@@ -160,6 +171,7 @@ def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
     Sources are read in LOCAL_SPACE.  Returns (ok: bool, error_str: str).
     """
     from . import jcns_drivers
+    from .modules_shim import get_mapping
 
     pose_bone = armature_obj.pose.bones.get(target_bone_name)
     if pose_bone is None:
@@ -178,11 +190,13 @@ def _apply_driver(armature_obj, target_bone_name, target_axis_idx,
         pose_bone.rotation_mode = 'XYZ'
 
     # Anchors in the driver's own units, so the namespace function converts nothing.
+    # 7th element is the curve-mode flag (see modules.jcns_mapping.is_two_point).
     maps = []
     for s in usable:
         vals = (s['from_start'], s['from_kink'], s['from_end'],
                 s['to_start'],   s['to_kink'],   s['to_end'])
-        maps.append(tuple(math.radians(v) for v in vals) if use_radians else tuple(vals))
+        conv = tuple(math.radians(v) for v in vals) if use_radians else tuple(vals)
+        maps.append(conv + (get_mapping().is_two_point(s.get('update_timing')),))
 
     key = jcns_drivers.channel_id(armature_obj.name, target_bone_name,
                                   transform_type, _AXIS_NAME[target_axis_idx])
@@ -296,13 +310,14 @@ def refresh_channel_values(obj):
 
     # Only the last constraint on the channel is live — see _apply_channel.
     maps = []
+    from .modules_shim import get_mapping
     for s in _sources_for_driver(members[-1].jcns_cns_props):
         if not s['bone']:
             continue
         vals = (s['from_start'], s['from_kink'], s['from_end'],
                 s['to_start'],   s['to_kink'],   s['to_end'])
-        maps.append(tuple(math.radians(v) for v in vals) if use_radians
-                    else tuple(vals))
+        conv = tuple(math.radians(v) for v in vals) if use_radians else tuple(vals)
+        maps.append(conv + (get_mapping().is_two_point(s.get('update_timing')),))
     if not maps:
         return False
 

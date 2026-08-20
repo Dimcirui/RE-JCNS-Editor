@@ -59,7 +59,17 @@ def jcns_ch(key, *values):
     maps = ch['maps']
     # Each source maps independently and the outputs add up — verified in-game
     # against a two-source constraint swept over its whole input range.
-    return sum(ev(*maps[i], v) for i, v in enumerate(values) if i < len(maps))
+    #
+    # A map entry is (fs, fk, fe, ts, tk, te, two_point).  Entries registered by
+    # an older build are 6-long; treat those as three-point, which is what the
+    # shipped data uses in ~86% of sources.
+    total = 0.0
+    for i, v in enumerate(values):
+        if i >= len(maps):
+            break
+        m = maps[i]
+        total += ev(*m[:6], v, two_point=(len(m) > 6 and m[6]))
+    return total
 
 
 def rebuild_all():
@@ -87,7 +97,8 @@ def rebuild_all():
                     continue
                 vals = (sp.from_start, sp.from_kink, sp.from_end,
                         sp.to_start, sp.to_kink, sp.to_end)
-                maps.append(tuple(math.radians(v) for v in vals) if use_rad else vals)
+                conv = tuple(math.radians(v) for v in vals) if use_rad else tuple(vals)
+                maps.append(conv + (get_mapping().is_two_point(sp.update_timing),))
             if maps:
                 register_channel(channel_id(arm.name, bone, transform, axis), maps)
                 rebuilt += 1

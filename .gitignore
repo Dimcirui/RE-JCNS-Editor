@@ -18,3 +18,6 @@ tests/
 
 # Claude Code 本地配置（含项目 skill），不属于插件
 .claude/
+
+# 本地 MCP 服务器配置（指向本机路径），不属于插件
+.mcp.json

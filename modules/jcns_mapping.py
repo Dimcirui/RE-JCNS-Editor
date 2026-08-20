@@ -22,24 +22,89 @@ Anchors, all in the file's own units (degrees for rotation):
 Segment 1 maps [A.x -> B.x] onto [A.y -> B.y]; segment 2 maps [B.x -> C.x] onto
 [B.y -> C.y].  Outside the covered range the output is clamped to the nearer
 segment's bound.
+
+TWO CURVE MODES (measured in-game 2026-08-21 against a purpose-built rig).  The
+per-source byte at +24 — which jcns_parser calls `UpdateTiming`, a misnomer —
+selects the curve shape:
+
+    +24 == 0     ->  TWO-POINT: the kink is ignored entirely; the output is the
+                     straight line A -> C.
+    +24 == 2, 3  ->  THREE-POINT: the piecewise curve described above.  2 and 3
+                     were bit-identical over 1510 frames across five degenerate
+                     and one non-degenerate geometry.
+
+Proof: two sources with identical geometry and identical +25, differing only in
++24, produced respectively an exact straight line and an exact piecewise curve
+(every binned sample matched its model to 0.01 deg, and local slopes were
+constant to four decimals within each segment — so the segments are strictly
+linear, not eased).  The constraint-level `Flags` bit 0 was independently shown
+to have no effect.  The byte at +25 shifts the sampled input quantity slightly
+but does NOT change the curve shape.
+
+Degenerate anchors, measured separately in each mode:
+
+    two-point    collapsing either segment changes nothing (it is a straight
+                 line regardless); all three `from` equal -> flat 0.
+    three-point  start == kink -> segment 2 governs, `to_start` ignored;
+                 kink == end   -> segment 1 governs, `to_end` ignored;
+                 all three equal -> steps at the kink between `to_start` and
+                 `to_end`, and `to_kink` never appears.
+                 A descending `from` range behaves exactly like the equivalent
+                 ascending one.
+
+UNTESTED: +24 == 1 (13.6% of shipped sources) and +24 == 4 / 5 (9 sources) have
+never been measured; is_two_point() lumps them in with three-point on no
+evidence.  Only 0 has been shown to be two-point.
 """
 
 
+def is_two_point(update_timing):
+    """Does this source use the two-point (straight line A -> C) curve mode?
+
+    The per-source byte at +24 — stored under the file-format name
+    `UpdateTiming` — is really the curve-mode selector.  Measured in-game
+    2026-08-21 over five degenerate and two non-degenerate geometries:
+    0 means two-point, every other observed value (2 and 3) means three-point,
+    and 2 and 3 are bit-identical in every case tested.
+
+    Only an explicit 0 selects two-point; anything else — including a missing
+    value — falls back to three-point, which is what the writer defaults to.
+
+    CAVEAT: only 0, 2 and 3 have been measured.  +24 == 1 is 13.6% of shipped
+    sources and is lumped in with three-point here on no evidence at all; 4 and 5
+    (9 sources total) likewise.  If a file with +24 == 1 ever previews wrong, this
+    is the first place to look.
+    """
+    return update_timing == 0
+
+
 def eval_piecewise(from_start, from_kink, from_end,
-                   to_start, to_kink, to_end, x):
-    """Output of the transfer function for a source value of `x`."""
+                   to_start, to_kink, to_end, x, two_point=False):
+    """Output of the transfer function for a source value of `x`.
+
+    `two_point=True` selects the +24 == 0 curve mode (straight line A -> C).
+    """
     span1 = from_kink - from_start
     span2 = from_end - from_kink
-
-    # Both segments collapsed: constant output.
-    if abs(span1) < 1e-9 and abs(span2) < 1e-9:
-        return to_start
+    total = from_end - from_start
 
     def seg(x0, y0, x1, y1, span):
         k = (y1 - y0) / span
         lo, hi = min(y0, y1), max(y0, y1)
         return max(lo, min(hi, y0 + (x - x0) * k))
 
+    if two_point:
+        if abs(total) < 1e-9:
+            return 0.0
+        return seg(from_start, to_start, from_end, to_end, total)
+
+    # Three-point mode.  Degenerate handling below was measured in-game
+    # 2026-08-21 (Round 12) and matches the original heuristics, except for the
+    # fully-collapsed case which steps between to_start and to_end.
+    if abs(span1) < 1e-9 and abs(span2) < 1e-9:
+        # Measured: x <= kink -> to_start, x > kink -> to_end.  to_kink never
+        # appears (a probe with to=(5, 33, 7) only ever produced 5 and 7).
+        return to_start if x <= from_kink else to_end
     if abs(span2) < 1e-9:                      # only segment 1 is live
         return seg(from_start, to_start, from_kink, to_kink, span1)
     if abs(span1) < 1e-9:                      # only segment 2 is live

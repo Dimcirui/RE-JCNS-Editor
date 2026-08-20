@@ -13,7 +13,7 @@ from bpy.types import PropertyGroup
 bl_info = {
     "name": "Wilds JCNS Editor",
     "author": "Dimcirui",
-    "version": (0, 13, 0),
+    "version": (0, 14, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > JCNS Editor | File > Import/Export",
     "description": (
@@ -39,23 +39,36 @@ AXIS_ITEMS = [
 
 # ConstraintSource_v2 bytes +24 / +25.
 #
-# These were previously exposed as an "Interpolation" dropdown based on bt v0.65.13,
-# which labelled +25 as InterpolationID (Linear / FastInAndOut / …).  Upstream bt
-# v0.65.14 renamed +24 to UpdateTimingID and +25 to TransformIDSrc, and the template
-# author marks BOTH readings "Not sure".
+# bt v0.65.13 exposed +25 as InterpolationID (Linear / FastInAndOut / …); v0.65.14
+# renamed +24 to UpdateTimingID and +25 to TransformIDSrc, marking BOTH "Not sure".
+#
+# MEASURED IN-GAME 2026-08-21 (MHWilds, live capture against a purpose-built rig):
+#
+#   +24 is the CURVE MODE, not an update timing.
+#       0  -> two-point: the kink is ignored outright; the output is the straight
+#              line (from_start,to_start) -> (from_end,to_end).
+#       2, 3 -> three-point: the classic piecewise curve; the kink is honoured.
+#              2 and 3 were bit-identical over 1510 frames across five degenerate
+#              and one non-degenerate geometry.
+#       Evidence: two sources with identical geometry and identical +25, differing
+#       only in +24, produced respectively an exact straight line and an exact
+#       piecewise curve.  See modules.jcns_mapping.is_two_point.
+#
+#   +25 shifts the sampled input quantity slightly but does NOT change the curve
+#       shape (isolating it moved the output by ~15 deg while the shape held).
+#
+#   The constraint-level Flags bit 0 has NO effect on the curve (bit-identical).
+#
+# UNTESTED, and the reason both bytes stay raw editable numbers:
+#   +24 == 1 occurs 3137 times (13.6% of sources) and has never been measured.
+#   The code currently lumps it in with the three-point modes, which is a GUESS —
+#   only 0 has been shown to be two-point.  +24 == 4 / 5 (9 sources) also untested.
 #
 # Survey of 23031 constraint sources across 884 v102 files:
 #     +24 ∈ {0: 1700, 1: 3137, 2: 1879, 3: 16306, 4: 2, 5: 7}
 #     +25 ∈ {0: 1285, 1: 1455, 2: 373, 3: 19053, 4: 273, 5: 592}
 # 21 distinct (+24, +25) combinations occur; the two bytes are NOT locked together.
-#
-# Neither reading fully accounts for the data: +24 reaches 4 and 5, outside
-# UpdateTimingID (0..3), and +25 reaches 5, outside TransformIDSrc (0..4) though
-# inside the older InterpolationID (0..6).  Both are marked "Not sure" upstream.
-#
-# Because the semantics are unresolved and a wrong guess silently changes engine
-# behaviour, both are edited as raw bytes rather than named enums.
-UPDATE_TIMING_HINT = "0=MotionBegin 1=MotionEnd 2=ConstraintBegin 3=ConstraintEnd (bt 0.65.14 guess)"
+UPDATE_TIMING_HINT = "bt 0.65.14 猜测为 0=MotionBegin 1=MotionEnd 2=ConstraintBegin 3=ConstraintEnd"
 
 TRANSFORM_ITEMS = [
     ('Translation',    "Translation",    "ID=0: Translational constraint"),
@@ -281,12 +294,13 @@ class JCNSSourceProperties(PropertyGroup):
     # If you clear bit0 to make a constraint override, an early +24 is the
     # matching choice.
     update_timing: IntProperty(
-        name="更新时机 (+24)",
+        name="曲线模式 (+24)",
         description=(
-            "ConstraintSource_v2 byte +24. Meaning unconfirmed — bt 0.65.14 reads it as "
-            "UpdateTimingID: " + UPDATE_TIMING_HINT + ". Observed values: 0..5. "
-            "Correlates strongly with flags bit0: override constraints read early "
-            "(MotionBegin/ConstraintBegin), additive ones read at ConstraintEnd"
+            "ConstraintSource_v2 byte +24 — 实测(2026-08-21)是曲线模式开关，不是更新时机。"
+            "0 = 两点直线：忽略折点，直接从 (from_start,to_start) 连到 (from_end,to_end)。"
+            "非 0（出货数据里出现 2 和 3，两者实测逐位相同）= 三点分段折线，折点生效。"
+            "出货数据里约 86% 的源是三点模式。"
+            "（bt 0.65.14 曾把它读作 UpdateTimingID：" + UPDATE_TIMING_HINT + "，那是误判）"
         ),
         default=3, min=0, max=255,
     )

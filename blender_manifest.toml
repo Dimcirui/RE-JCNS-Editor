@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "wilds_jcns_editor"
-version = "0.13.0"
+version = "0.14.0"
 name = "Wilds JCNS 编辑器"
 tagline = "导入、编辑并导出怪物猎人荒野的关节约束文件"
 maintainer = "Dimcirui"
