@@ -27,11 +27,12 @@ TWO CURVE MODES (measured in-game 2026-08-21 against a purpose-built rig).  The
 per-source byte at +24 — which jcns_parser calls `UpdateTiming`, a misnomer —
 selects the curve shape:
 
-    +24 == 0     ->  TWO-POINT: the kink is ignored entirely; the output is the
+    +24 == 0, 1  ->  TWO-POINT: the kink is ignored entirely; the output is the
                      straight line A -> C.
-    +24 == 2, 3  ->  THREE-POINT: the piecewise curve described above.  2 and 3
-                     were bit-identical over 1510 frames across five degenerate
-                     and one non-degenerate geometry.
+    +24 == 2, 3  ->  THREE-POINT: the piecewise curve described above.
+
+Within each pair the members were bit-identical across every geometry tested, so
+the split is exactly bit 1 (0x02).
 
 Proof: two sources with identical geometry and identical +25, differing only in
 +24, produced respectively an exact straight line and an exact piecewise curve
@@ -51,10 +52,12 @@ Degenerate anchors, measured separately in each mode:
                  `to_end`, and `to_kink` never appears.
                  A descending `from` range behaves exactly like the equivalent
                  ascending one.
+                 A kink lying strictly OUTSIDE [start, end] kills the source:
+                 the output is a flat 0, not a clamped constant.  Measured over
+                 three such geometries, including a pair differing only in
+                 `to_start` by 90 deg that produced identical flat zeros.
 
-UNTESTED: +24 == 1 (13.6% of shipped sources) and +24 == 4 / 5 (9 sources) have
-never been measured; is_two_point() lumps them in with three-point on no
-evidence.  Only 0 has been shown to be two-point.
+UNTESTED: +24 == 4 / 5 (9 sources in the whole corpus).
 """
 
 
@@ -67,15 +70,12 @@ def is_two_point(update_timing):
     0 means two-point, every other observed value (2 and 3) means three-point,
     and 2 and 3 are bit-identical in every case tested.
 
-    Only an explicit 0 selects two-point; anything else — including a missing
-    value — falls back to three-point, which is what the writer defaults to.
-
-    CAVEAT: only 0, 2 and 3 have been measured.  +24 == 1 is 13.6% of shipped
-    sources and is lumped in with three-point here on no evidence at all; 4 and 5
-    (9 sources total) likewise.  If a file with +24 == 1 ever previews wrong, this
-    is the first place to look.
+    Measured: 0 and 1 are two-point, 2 and 3 are three-point.  That split is
+    exactly bit 1 (0x02), which is probably the real encoding, but 4 and 5 (9
+    sources in the whole corpus) were never measured, so this sticks to the
+    values actually observed rather than extrapolating the bit reading.
     """
-    return update_timing == 0
+    return update_timing in (0, 1)
 
 
 def eval_piecewise(from_start, from_kink, from_end,
@@ -98,9 +98,17 @@ def eval_piecewise(from_start, from_kink, from_end,
             return 0.0
         return seg(from_start, to_start, from_end, to_end, total)
 
-    # Three-point mode.  Degenerate handling below was measured in-game
-    # 2026-08-21 (Round 12) and matches the original heuristics, except for the
-    # fully-collapsed case which steps between to_start and to_end.
+    # Three-point mode.  A kink strictly outside the [start, end] span kills the
+    # whole source — measured over three such geometries (kink past the end, kink
+    # before the start, and the same with a wildly different to_start), all of
+    # which produced a flat 0 while neighbouring slots evaluated normally.
+    lo, hi = (from_start, from_end) if from_start <= from_end else (from_end, from_start)
+    if from_kink < lo - 1e-9 or from_kink > hi + 1e-9:
+        return 0.0
+
+    # Degenerate handling below was measured in-game (Round 12) and matches the
+    # original heuristics, except for the fully-collapsed case which steps
+    # between to_start and to_end.
     if abs(span1) < 1e-9 and abs(span2) < 1e-9:
         # Measured: x <= kink -> to_start, x > kink -> to_end.  to_kink never
         # appears (a probe with to=(5, 33, 7) only ever produced 5 and 7).

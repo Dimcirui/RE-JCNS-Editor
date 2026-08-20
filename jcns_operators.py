@@ -85,9 +85,15 @@ def _build_piecewise_expr(from_start, from_kink, from_end,
         lo, hi = min(ts, te), max(ts, te)
         return f"max({lo:.6f}, min({hi:.6f}, {ts:.6f} + ({var} - {fs:.6f}) * {k:.6f}))"
 
-    # Three-point mode.  Degenerate handling below was measured in-game
-    # (Round 12); the fully-collapsed case steps between to_start and to_end and
-    # never yields to_kink.  Keep the ternary parenthesised — see the note below.
+    # Three-point mode.  A kink strictly outside the [start, end] span kills the
+    # source outright (measured); keep in sync with jcns_mapping.eval_piecewise.
+    _lo, _hi = (fs, fe) if fs <= fe else (fe, fs)
+    if fk < _lo - 1e-9 or fk > _hi + 1e-9:
+        return "0.000000"
+
+    # Degenerate handling below was measured in-game (Round 12); the
+    # fully-collapsed case steps between to_start and to_end and never yields
+    # to_kink.  Keep the ternary parenthesised — see the note below.
     if abs(span1) < 1e-9 and abs(span2) < 1e-9:
         return f"(({ts:.6f}) if {var} <= {fk:.6f} else ({te:.6f}))"
     if abs(span2) < 1e-9:

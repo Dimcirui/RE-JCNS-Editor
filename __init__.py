@@ -13,7 +13,7 @@ from bpy.types import PropertyGroup
 bl_info = {
     "name": "Wilds JCNS Editor",
     "author": "Dimcirui",
-    "version": (0, 14, 0),
+    "version": (0, 14, 1),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > JCNS Editor | File > Import/Export",
     "description": (
@@ -45,24 +45,30 @@ AXIS_ITEMS = [
 # MEASURED IN-GAME 2026-08-21 (MHWilds, live capture against a purpose-built rig):
 #
 #   +24 is the CURVE MODE, not an update timing.
-#       0  -> two-point: the kink is ignored outright; the output is the straight
-#              line (from_start,to_start) -> (from_end,to_end).
+#       0, 1 -> two-point: the kink is ignored outright; the output is the
+#              straight line (from_start,to_start) -> (from_end,to_end).
 #       2, 3 -> three-point: the classic piecewise curve; the kink is honoured.
-#              2 and 3 were bit-identical over 1510 frames across five degenerate
-#              and one non-degenerate geometry.
-#       Evidence: two sources with identical geometry and identical +25, differing
-#       only in +24, produced respectively an exact straight line and an exact
-#       piecewise curve.  See modules.jcns_mapping.is_two_point.
+#       Within each pair the members were bit-identical across every geometry
+#       tested, so the split is exactly bit 1 (0x02).  Evidence: sources with
+#       identical geometry and identical +25, differing only in +24, produced an
+#       exact straight line vs an exact piecewise curve, and changing to_kink
+#       moved the output by 30 deg in three-point mode and by 0.00000 deg in
+#       two-point mode.  See modules.jcns_mapping.is_two_point.
+#
+#   In three-point mode, a kink lying strictly outside the [start, end] span
+#       kills the source outright — the output is a flat 0, not a clamped
+#       constant.  Measured over three such geometries.  (3.1% of shipped sources
+#       have an out-of-range kink, but 96% of those are two-point, where the kink
+#       is ignored anyway; only 26 sources are actually affected.)
 #
 #   +25 shifts the sampled input quantity slightly but does NOT change the curve
 #       shape (isolating it moved the output by ~15 deg while the shape held).
 #
 #   The constraint-level Flags bit 0 has NO effect on the curve (bit-identical).
 #
-# UNTESTED, and the reason both bytes stay raw editable numbers:
-#   +24 == 1 occurs 3137 times (13.6% of sources) and has never been measured.
-#   The code currently lumps it in with the three-point modes, which is a GUESS —
-#   only 0 has been shown to be two-point.  +24 == 4 / 5 (9 sources) also untested.
+# UNTESTED, and part of why both bytes stay raw editable numbers:
+#   +24 == 4 / 5 (9 sources in the whole corpus).  is_two_point() sticks to the
+#   values actually measured rather than extrapolating the bit-1 reading.
 #
 # Survey of 23031 constraint sources across 884 v102 files:
 #     +24 ∈ {0: 1700, 1: 3137, 2: 1879, 3: 16306, 4: 2, 5: 7}
@@ -297,9 +303,9 @@ class JCNSSourceProperties(PropertyGroup):
         name="曲线模式 (+24)",
         description=(
             "ConstraintSource_v2 byte +24 — 实测(2026-08-21)是曲线模式开关，不是更新时机。"
-            "0 = 两点直线：忽略折点，直接从 (from_start,to_start) 连到 (from_end,to_end)。"
-            "非 0（出货数据里出现 2 和 3，两者实测逐位相同）= 三点分段折线，折点生效。"
-            "出货数据里约 86% 的源是三点模式。"
+            "0 和 1 = 两点直线：忽略折点，直接从 (from_start,to_start) 连到 (from_end,to_end)。"
+            "2 和 3 = 三点分段折线，折点生效。每一对内部实测逐位相同，即 bit 1 (0x02) 决定模式。"
+            "三点模式下若折点落在 [start, end] 区间之外，整条源失效、输出恒 0。"
             "（bt 0.65.14 曾把它读作 UpdateTimingID：" + UPDATE_TIMING_HINT + "，那是误判）"
         ),
         default=3, min=0, max=255,
